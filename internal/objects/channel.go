@@ -103,6 +103,10 @@ func HeaderEntriesToOverrideOperations(headers []HeaderEntry) []OverrideOperatio
 }
 
 type TransformOptions struct {
+	// EnableResponsesChatCompat enables the beta high-fidelity conversion for
+	// Responses requests served by Chat Completions endpoints on this channel.
+	EnableResponsesChatCompat bool `json:"enableResponsesChatCompat"`
+
 	// ForceArrayInstructions forces the channel to accept array format for instructions.
 	ForceArrayInstructions bool `json:"forceArrayInstructions"`
 

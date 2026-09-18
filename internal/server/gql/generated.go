@@ -1943,6 +1943,7 @@ type ComplexityRoot struct {
 	}
 
 	TransformOptions struct {
+		EnableResponsesChatCompat      func(childComplexity int) int
 		ForceArrayInputs               func(childComplexity int) int
 		ForceArrayInstructions         func(childComplexity int) int
 		ReasoningEffortMapping         func(childComplexity int) int
@@ -10779,6 +10780,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.complexity.TraceEdge.Node(childComplexity), true
 
+	case "TransformOptions.enableResponsesChatCompat":
+		if e.complexity.TransformOptions.EnableResponsesChatCompat == nil {
+			break
+		}
+
+		return e.complexity.TransformOptions.EnableResponsesChatCompat(childComplexity), true
 	case "TransformOptions.forceArrayInputs":
 		if e.complexity.TransformOptions.ForceArrayInputs == nil {
 			break
@@ -25087,6 +25094,8 @@ func (ec *executionContext) fieldContext_ChannelSettings_transformOptions(_ cont
 		IsResolver: false,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 			switch field.Name {
+			case "enableResponsesChatCompat":
+				return ec.fieldContext_TransformOptions_enableResponsesChatCompat(ctx, field)
 			case "forceArrayInstructions":
 				return ec.fieldContext_TransformOptions_forceArrayInstructions(ctx, field)
 			case "forceArrayInputs":
@@ -57667,6 +57676,35 @@ func (ec *executionContext) fieldContext_TraceEdge_cursor(_ context.Context, fie
 	return fc, nil
 }
 
+func (ec *executionContext) _TransformOptions_enableResponsesChatCompat(ctx context.Context, field graphql.CollectedField, obj *objects.TransformOptions) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		ec.fieldContext_TransformOptions_enableResponsesChatCompat,
+		func(ctx context.Context) (any, error) {
+			return obj.EnableResponsesChatCompat, nil
+		},
+		nil,
+		ec.marshalNBoolean2bool,
+		true,
+		true,
+	)
+}
+
+func (ec *executionContext) fieldContext_TransformOptions_enableResponsesChatCompat(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "TransformOptions",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return nil, errors.New("field of type Boolean does not have child fields")
+		},
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _TransformOptions_forceArrayInstructions(ctx context.Context, field graphql.CollectedField, obj *objects.TransformOptions) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -84271,13 +84309,20 @@ func (ec *executionContext) unmarshalInputTransformOptionsInput(ctx context.Cont
 		asMap[k] = v
 	}
 
-	fieldsInOrder := [...]string{"forceArrayInstructions", "forceArrayInputs", "replaceDeveloperRoleWithSystem", "reasoningEffortMapping"}
+	fieldsInOrder := [...]string{"enableResponsesChatCompat", "forceArrayInstructions", "forceArrayInputs", "replaceDeveloperRoleWithSystem", "reasoningEffortMapping"}
 	for _, k := range fieldsInOrder {
 		v, ok := asMap[k]
 		if !ok {
 			continue
 		}
 		switch k {
+		case "enableResponsesChatCompat":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("enableResponsesChatCompat"))
+			data, err := ec.unmarshalOBoolean2bool(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.EnableResponsesChatCompat = data
 		case "forceArrayInstructions":
 			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("forceArrayInstructions"))
 			data, err := ec.unmarshalOBoolean2bool(ctx, v)
@@ -108504,6 +108549,11 @@ func (ec *executionContext) _TransformOptions(ctx context.Context, sel ast.Selec
 		switch field.Name {
 		case "__typename":
 			out.Values[i] = graphql.MarshalString("TransformOptions")
+		case "enableResponsesChatCompat":
+			out.Values[i] = ec._TransformOptions_enableResponsesChatCompat(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		case "forceArrayInstructions":
 			out.Values[i] = ec._TransformOptions_forceArrayInstructions(ctx, field, obj)
 			if out.Values[i] == graphql.Null {

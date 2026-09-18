@@ -49,6 +49,12 @@ const (
 	maxUserIDLength = 128
 )
 
+var _ transformer.ResponsesRequestCapabilitiesProvider = (*OutboundTransformer)(nil)
+
+func (t *OutboundTransformer) ResponsesRequestCapabilities(req *llm.Request) transformer.ResponsesRequestCapabilities {
+	return transformer.ResponsesRequestCapabilitiesOf(t.Outbound, req)
+}
+
 // NewOutboundTransformer creates a new Zai OutboundTransformer with legacy parameters.
 func NewOutboundTransformer(baseURL, apiKey string) (transformer.Outbound, error) {
 	config := &Config{
@@ -235,8 +241,12 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: messages are required", transformer.ErrInvalidRequest)
 	}
 
-	// Convert llm.Request to openai.Request first
-	oaiReq := openai.RequestFromLLM(ctx, llmReq, openai.ReasoningFieldContent)
+	oaiReq, transformerMetadata, err := openai.RequestFromLLMWithResponsesTools(
+		ctx, llmReq, openai.ReasoningFieldContent,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Zai doesn't support json_schema, convert to json_object
 	if oaiReq.ResponseFormat != nil && oaiReq.ResponseFormat.Type == "json_schema" {
@@ -324,12 +334,13 @@ func (t *OutboundTransformer) TransformRequest(
 	}
 
 	return &httpclient.Request{
-		Method:    http.MethodPost,
-		URL:       url,
-		Headers:   headers,
-		Body:      body,
-		Auth:      auth,
-		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
+		Method:              http.MethodPost,
+		URL:                 url,
+		Headers:             headers,
+		Body:                body,
+		Auth:                auth,
+		APIFormat:           string(llm.APIFormatOpenAIChatCompletion),
+		TransformerMetadata: transformerMetadata,
 	}, nil
 }
 

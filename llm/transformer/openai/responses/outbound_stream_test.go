@@ -86,6 +86,8 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 			// exclude the last DONE event
 			for i, expectedEvent := range expectedEvents[:len(expectedEvents)-1] {
+				normalizeResponsesStreamCompatibilityFields(expectedEvent)
+				normalizeResponsesStreamCompatibilityFields(actualLLMResponses[i])
 				if !xtest.Equal(expectedEvent, actualLLMResponses[i]) {
 					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expectedEvent, actualLLMResponses[i]))
 				}
@@ -119,6 +121,27 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 					"Final response ID should match")
 			}
 		})
+	}
+}
+
+func normalizeResponsesStreamCompatibilityFields(response *llm.Response) {
+	if response == nil {
+		return
+	}
+	if response.TransformerMetadata != nil {
+		delete(response.TransformerMetadata, responsesEchoFieldsTransformerMetadataKey)
+		if len(response.TransformerMetadata) == 0 {
+			response.TransformerMetadata = nil
+		}
+	}
+	for index := range response.Choices {
+		delta := response.Choices[index].Delta
+		if delta == nil || delta.Role != "assistant" || len(delta.Content.MultipleContent) != 0 {
+			continue
+		}
+		if delta.Content.Content == nil || *delta.Content.Content == "" {
+			delta.Content.Content = nil
+		}
 	}
 }
 

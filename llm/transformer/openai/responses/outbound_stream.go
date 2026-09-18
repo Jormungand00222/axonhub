@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"reflect"
 	"strings"
 
@@ -73,6 +74,11 @@ type outboundStreamState struct {
 	// Transformer metadata tracking
 	transformerMetadata        map[string]any
 	transformerMetadataEmitted bool
+
+	// echoResponse holds the upstream Response object for echoing
+	// request-parameter fields (conversation, metadata, reasoning, etc.)
+	// that are not part of the unified llm.Response IR.
+	echoResponse *Response
 }
 
 func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent]) *responsesOutboundStream {
@@ -90,6 +96,26 @@ func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent]) 
 
 func (s *responsesOutboundStream) enqueue(resp *llm.Response) {
 	s.eventQueue = append(s.eventQueue, resp)
+}
+
+// attachEchoFields stores the upstream Response echo fields on the emitted
+// llm.Response chunk's TransformerMetadata so the inbound stream can restore
+// them when rebuilding response.created / response.completed events.
+func (s *responsesOutboundStream) attachEchoFields(resp *llm.Response) {
+	if s.state.echoResponse == nil {
+		return
+	}
+	if resp.TransformerMetadata == nil {
+		resp.TransformerMetadata = map[string]any{}
+	}
+	encoded, err := json.Marshal(s.state.echoResponse)
+	if err != nil {
+		slog.Warn("failed to serialize Responses echo fields",
+			slog.String("response_id", s.state.echoResponse.ID),
+			slog.Any("error", err))
+		return
+	}
+	resp.TransformerMetadata[responsesEchoFieldsTransformerMetadataKey] = json.RawMessage(encoded)
 }
 
 func (s *responsesOutboundStream) Next() bool {
@@ -189,6 +215,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				s.state.usage = streamEvent.Response.Usage.ToUsage()
 				resp.Usage = s.state.usage
 			}
+			s.state.echoResponse = streamEvent.Response
 		}
 
 		resp.Choices = []llm.Choice{
@@ -199,6 +226,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				},
 			},
 		}
+		s.attachEchoFields(resp)
 
 	case StreamEventTypeResponseInProgress:
 		// Update state but don't emit an event
@@ -276,9 +304,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				ID:   item.CallID,
 				Type: llm.ToolTypeResponsesCustomTool,
 				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-					CallID: item.CallID,
-					Name:   item.Name,
-					Input:  "",
+					CallID:    item.CallID,
+					Name:      item.Name,
+					Namespace: item.Namespace,
+					Input:     "",
 				},
 			}
 			s.state.itemToCallID[item.ID] = item.CallID
@@ -294,8 +323,43 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 								Type:  llm.ToolTypeResponsesCustomTool,
 								Index: toolCallIdx,
 								ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-									CallID: item.CallID,
-									Name:   item.Name,
+									CallID:    item.CallID,
+									Name:      item.Name,
+									Namespace: item.Namespace,
+								},
+							},
+						},
+					},
+				},
+			}
+
+		case "tool_search_call":
+			toolCallIdx := len(s.state.toolCalls)
+			s.state.toolCalls[item.CallID] = &llm.ToolCall{
+				ID:   item.CallID,
+				Type: llm.ToolTypeResponsesToolSearch,
+				ResponseToolSearchCall: &llm.ResponseToolSearchCall{
+					CallID:    item.CallID,
+					Execution: item.Execution,
+					Arguments: item.Arguments,
+				},
+			}
+			s.state.itemToCallID[item.ID] = item.CallID
+			s.state.toolCallIndex[item.CallID] = toolCallIdx
+
+			resp.Choices = []llm.Choice{
+				{
+					Index: 0,
+					Delta: &llm.Message{
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:    item.CallID,
+								Type:  llm.ToolTypeResponsesToolSearch,
+								Index: toolCallIdx,
+								ResponseToolSearchCall: &llm.ResponseToolSearchCall{
+									CallID:    item.CallID,
+									Execution: item.Execution,
+									Arguments: item.Arguments,
 								},
 							},
 						},
@@ -319,8 +383,31 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			}
 
 			if tc, ok := s.state.toolCalls[callID]; ok {
-				tc.Function.Arguments += streamEvent.Delta
 				toolCallIdx := s.state.toolCallIndex[callID]
+				if tc.ResponseToolSearchCall != nil {
+					tc.ResponseToolSearchCall.Arguments += streamEvent.Delta
+					resp.Choices = []llm.Choice{
+						{
+							Index: 0,
+							Delta: &llm.Message{
+								ToolCalls: []llm.ToolCall{
+									{
+										Index: toolCallIdx,
+										Type:  llm.ToolTypeResponsesToolSearch,
+										ResponseToolSearchCall: &llm.ResponseToolSearchCall{
+											CallID:    callID,
+											Execution: tc.ResponseToolSearchCall.Execution,
+											Arguments: streamEvent.Delta,
+										},
+									},
+								},
+							},
+						},
+					}
+					break
+				}
+
+				tc.Function.Arguments += streamEvent.Delta
 
 				resp.Choices = []llm.Choice{
 					{
@@ -353,6 +440,49 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		tc, ok := s.state.toolCalls[callID]
 		if !ok {
 			return nil // Intentionally skip an unknown tool call.
+		}
+
+		if tc.ResponseToolSearchCall != nil {
+			finalArgs := streamEvent.Arguments
+			if finalArgs == "" {
+				return nil // An empty done event must not overwrite accumulated deltas.
+			}
+
+			// Some upstreams provide the complete arguments only in the done
+			// event. Preserve arguments already emitted through delta events and
+			// forward only the missing suffix so downstream Responses streams
+			// receive the full value once.
+			missingArgs, err := toolSearchMissingArguments(callID, tc.ResponseToolSearchCall.Arguments, finalArgs)
+			if err != nil {
+				return err
+			}
+
+			tc.ResponseToolSearchCall.Arguments = finalArgs
+			if missingArgs == "" {
+				return nil
+			}
+
+			toolCallIdx := s.state.toolCallIndex[callID]
+			resp.Choices = []llm.Choice{
+				{
+					Index: 0,
+					Delta: &llm.Message{
+						ToolCalls: []llm.ToolCall{
+							{
+								Index: toolCallIdx,
+								Type:  llm.ToolTypeResponsesToolSearch,
+								ResponseToolSearchCall: &llm.ResponseToolSearchCall{
+									CallID:    callID,
+									Execution: tc.ResponseToolSearchCall.Execution,
+									Arguments: missingArgs,
+								},
+							},
+						},
+					},
+				},
+			}
+
+			break
 		}
 
 		identityChanged := false
@@ -437,9 +567,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 									Index: toolCallIdx,
 									Type:  llm.ToolTypeResponsesCustomTool,
 									ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-										CallID: callID,
-										Name:   tc.ResponseCustomToolCall.Name,
-										Input:  streamEvent.Delta,
+										CallID:    callID,
+										Name:      tc.ResponseCustomToolCall.Name,
+										Namespace: tc.ResponseCustomToolCall.Namespace,
+										Input:     streamEvent.Delta,
 									},
 								},
 							},
@@ -517,6 +648,49 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 	case StreamEventTypeOutputItemDone:
 		if streamEvent.Item == nil {
 			return nil // Intentionally skip this event
+		}
+		if streamEvent.Item.Type == "tool_search_call" {
+			if tc, ok := s.state.toolCalls[streamEvent.Item.CallID]; ok && tc.ResponseToolSearchCall != nil {
+				executionChanged := false
+				if streamEvent.Item.Execution != "" {
+					executionChanged = tc.ResponseToolSearchCall.Execution != streamEvent.Item.Execution
+					tc.ResponseToolSearchCall.Execution = streamEvent.Item.Execution
+				}
+				missingArgs := ""
+				if streamEvent.Item.Arguments != "" {
+					var err error
+					missingArgs, err = toolSearchMissingArguments(
+						streamEvent.Item.CallID,
+						tc.ResponseToolSearchCall.Arguments,
+						streamEvent.Item.Arguments,
+					)
+					if err != nil {
+						return err
+					}
+					tc.ResponseToolSearchCall.Arguments = streamEvent.Item.Arguments
+				}
+				if !executionChanged && missingArgs == "" {
+					return nil
+				}
+
+				toolCallIdx := s.state.toolCallIndex[streamEvent.Item.CallID]
+				resp.Choices = []llm.Choice{{
+					Index: 0,
+					Delta: &llm.Message{
+						ToolCalls: []llm.ToolCall{{
+							Index: toolCallIdx,
+							Type:  llm.ToolTypeResponsesToolSearch,
+							ResponseToolSearchCall: &llm.ResponseToolSearchCall{
+								CallID:    streamEvent.Item.CallID,
+								Execution: tc.ResponseToolSearchCall.Execution,
+								Arguments: missingArgs,
+							},
+						}},
+					},
+				}}
+				break
+			}
+			return nil // Tool call was emitted by item.added and argument deltas.
 		}
 		if streamEvent.Item.Type == "compaction" || streamEvent.Item.Type == "compaction_summary" {
 			resp.Choices = []llm.Choice{{
@@ -600,6 +774,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			resp.TransformerMetadata = s.state.transformerMetadata
 			s.state.transformerMetadataEmitted = true
 		}
+		if streamEvent.Response != nil {
+			s.state.echoResponse = streamEvent.Response
+		}
 
 		// Some compatible providers report abnormal outcomes in response.completed
 		// instead of a separate terminal event. Preserve those statuses too.
@@ -642,12 +819,38 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			},
 		}
 
+		// Attach echo fields before the usage path below so the completed chunk
+		// carries them even when it is enqueued and returned early.
+		s.attachEchoFields(resp)
+		attachResponsesTerminalDetails(resp, streamEvent.Response)
+
+		// Second event: usage (if available)
+		if streamEvent.Response != nil && streamEvent.Response.Usage != nil {
+			s.state.usage = streamEvent.Response.Usage.ToUsage()
+			usageResp := &llm.Response{
+				Object:             "chat.completion.chunk",
+				ID:                 s.state.responseID,
+				Model:              s.state.responseModel,
+				Created:            s.state.created,
+				PreviousResponseID: s.state.previousResponseID,
+				Choices:            []llm.Choice{},
+				Usage:              s.state.usage,
+			}
+
+			s.enqueue(resp)
+			s.enqueue(usageResp)
+
+			return nil
+		}
 	case StreamEventTypeResponseFailed:
 		if s.responseCompleted {
 			return nil
 		}
 		// Response failed
 		s.responseCompleted = true
+		if streamEvent.Response != nil {
+			s.state.echoResponse = streamEvent.Response
+		}
 		finishReason := "error"
 		resp.Choices = []llm.Choice{
 			{
@@ -655,6 +858,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				FinishReason: &finishReason,
 			},
 		}
+		s.attachEchoFields(resp)
 
 	case StreamEventTypeResponseIncomplete:
 		if s.responseCompleted {
@@ -662,6 +866,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 		// Response incomplete (e.g., max tokens)
 		s.responseCompleted = true
+		if streamEvent.Response != nil {
+			s.state.echoResponse = streamEvent.Response
+		}
 		finishReason := "length"
 		if streamEvent.Response != nil && streamEvent.Response.IncompleteDetails != nil &&
 			streamEvent.Response.IncompleteDetails.Reason == "content_filter" {
@@ -673,6 +880,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				FinishReason: &finishReason,
 			},
 		}
+		s.attachEchoFields(resp)
 
 	case StreamEventTypeResponseCancelled:
 		if s.responseCompleted {
@@ -680,6 +888,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 		// Response cancelled
 		s.responseCompleted = true
+		if streamEvent.Response != nil {
+			s.state.echoResponse = streamEvent.Response
+		}
 		finishReason := "cancelled"
 		resp.Choices = []llm.Choice{
 			{
@@ -687,6 +898,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				FinishReason: &finishReason,
 			},
 		}
+		s.attachEchoFields(resp)
 
 	case StreamEventTypeError:
 		detail := llm.ErrorDetail{
@@ -752,15 +964,8 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		return nil // Intentionally skip this event
 	}
 
-	if s.responseCompleted && streamEvent.Response != nil &&
-		(streamEvent.Response.Error != nil || streamEvent.Response.IncompleteDetails != nil) {
-		if resp.TransformerMetadata == nil {
-			resp.TransformerMetadata = make(map[string]any)
-		}
-		resp.TransformerMetadata[responsesTerminalDetailsTransformerMetadataKey] = responsesTerminalDetails{
-			Error:             streamEvent.Response.Error,
-			IncompleteDetails: streamEvent.Response.IncompleteDetails,
-		}
+	if s.responseCompleted {
+		attachResponsesTerminalDetails(resp, streamEvent.Response)
 	}
 
 	s.enqueue(resp)
@@ -782,6 +987,19 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 	return nil
 }
 
+func attachResponsesTerminalDetails(resp *llm.Response, response *Response) {
+	if resp == nil || response == nil || (response.Error == nil && response.IncompleteDetails == nil) {
+		return
+	}
+	if resp.TransformerMetadata == nil {
+		resp.TransformerMetadata = make(map[string]any)
+	}
+	resp.TransformerMetadata[responsesTerminalDetailsTransformerMetadataKey] = responsesTerminalDetails{
+		Error:             response.Error,
+		IncompleteDetails: response.IncompleteDetails,
+	}
+}
+
 func equalJSONValues(left, right string) bool {
 	leftValue, err := decodeJSONValue(left)
 	if err != nil {
@@ -793,7 +1011,62 @@ func equalJSONValues(left, right string) bool {
 		return false
 	}
 
-	return reflect.DeepEqual(leftValue, rightValue)
+	return equalDecodedJSONValues(leftValue, rightValue)
+}
+
+func toolSearchMissingArguments(callID, forwardedArgs, finalArgs string) (string, error) {
+	switch {
+	case forwardedArgs == "":
+		return finalArgs, nil
+	case strings.HasPrefix(finalArgs, forwardedArgs):
+		return strings.TrimPrefix(finalArgs, forwardedArgs), nil
+	case equalJSONValues(forwardedArgs, finalArgs):
+		return "", nil
+	default:
+		return "", fmt.Errorf("tool search call arguments mismatch for call_id %q", callID)
+	}
+}
+
+func equalDecodedJSONValues(left, right any) bool {
+	switch leftValue := left.(type) {
+	case json.Number:
+		rightValue, ok := right.(json.Number)
+		if !ok {
+			return false
+		}
+		if leftValue.String() == rightValue.String() {
+			return true
+		}
+		var leftRat, rightRat big.Rat
+		_, leftOK := leftRat.SetString(leftValue.String())
+		_, rightOK := rightRat.SetString(rightValue.String())
+		return leftOK && rightOK && leftRat.Cmp(&rightRat) == 0
+	case []any:
+		rightValue, ok := right.([]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for index := range leftValue {
+			if !equalDecodedJSONValues(leftValue[index], rightValue[index]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		rightValue, ok := right.(map[string]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for key, leftItem := range leftValue {
+			rightItem, exists := rightValue[key]
+			if !exists || !equalDecodedJSONValues(leftItem, rightItem) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(left, right)
+	}
 }
 
 // decodeJSONValue preserves numeric lexemes so semantic comparisons do not

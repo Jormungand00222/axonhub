@@ -58,6 +58,7 @@ type ReasoningEffortMapping {
 }
 
 type TransformOptions {
+  enableResponsesChatCompat: Boolean!
   forceArrayInstructions: Boolean!
   forceArrayInputs: Boolean!
   replaceDeveloperRoleWithSystem: Boolean!
@@ -76,6 +77,7 @@ input ReasoningEffortMappingInput {
 }
 
 input TransformOptionsInput {
+  enableResponsesChatCompat: Boolean
   forceArrayInstructions: Boolean
   forceArrayInputs: Boolean
   replaceDeveloperRoleWithSystem: Boolean

@@ -207,7 +207,7 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			},
 			expectError: false,
 			validate: func(t *testing.T, result *llm.Request) {
-				require.Len(t, result.Tools, 3)
+				require.Len(t, result.Tools, 4)
 
 				namespaceTool := result.Tools[0]
 				require.Equal(t, "function", namespaceTool.Type)
@@ -218,7 +218,8 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 				require.True(t, *namespaceTool.Function.Strict)
 
 				require.Equal(t, "mcp__codebase_memory_mcp__get_project", result.Tools[1].Function.Name)
-				require.Equal(t, "get_weather", result.Tools[2].Function.Name)
+				require.Equal(t, llm.ToolTypeResponsesOpaqueTool, result.Tools[2].Type)
+				require.Equal(t, "get_weather", result.Tools[3].Function.Name)
 			},
 		},
 		{
@@ -249,7 +250,9 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			},
 			expectError: false,
 			validate: func(t *testing.T, result *llm.Request) {
-				require.Len(t, result.Tools, 1)
+				require.Len(t, result.Tools, 2)
+				require.Equal(t, llm.ToolTypeResponsesToolSearch, result.Tools[0].Type)
+				require.Equal(t, "get_weather", result.Tools[1].Function.Name)
 				require.NotNil(t, result.ProviderExtensions)
 				require.NotNil(t, result.ProviderExtensions.OpenAIResponses)
 				require.NotNil(t, result.ProviderExtensions.OpenAIResponses.Request)

@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/samber/lo"
@@ -12,14 +13,134 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
+const (
+	// emptyAssistantContentPlaceholder replaces the content of assistant turns
+	// that carry none: turns that only request tool calls, turns that only carry
+	// reasoning, and turns whose parts were all filtered out (compaction, or a
+	// stripped sanitization marker). It cannot be an empty or whitespace-only
+	// string, because LiteLLM-family gateways rewrite any blank content into
+	// litellmSanitizedEmptyContentMarker, which pollutes the model's context and
+	// gets copied into its output. It cannot be null either, because stricter
+	// OpenAI-compatible upstreams reject a missing or null content with a 400
+	// schema error. A single "." passes those gateways unchanged and models do
+	// not mimic it.
+	emptyAssistantContentPlaceholder = "."
+
+	// litellmSanitizedEmptyContentMarker is the placeholder LiteLLM-family
+	// gateways substitute for blank message content. History replayed from such
+	// a gateway carries it as real text, so assistant turns whose content is only
+	// this marker are treated as content-less.
+	litellmSanitizedEmptyContentMarker = "[System: Empty message content sanitised to satisfy protocol]"
+)
+
 // RequestFromLLM creates an OpenAI Request from unified llm.Request with reasoning
 // field configuration. When the request has no explicit prompt cache key, ctx's
 // session ID is used as a fallback when available.
 func RequestFromLLM(ctx context.Context, r *llm.Request, reasoningField ReasoningField) *Request {
+	req, _ := requestFromLLM(ctx, r, reasoningField)
+	return req
+}
+
+func requestFromLLM(ctx context.Context, r *llm.Request, reasoningField ReasoningField) (*Request, error) {
 	if r == nil {
-		return nil
+		return nil, nil
+	}
+	// The plain codec cannot represent Responses-only tool lifecycle state.
+	// Wrapper transformers call this codec directly, so downgrade here to keep
+	// specialized calls from being serialized as invalid Chat history entries
+	// (empty names/arguments) that strict providers reject.
+	if isResponsesAPIFormat(r.APIFormat) && !r.TransformOptions.DisableResponsesChatCompat {
+		var err error
+		r, err = shared.DowngradeResponsesChatToolLifecycle(r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to downgrade Responses tool lifecycle: %w", err)
+		}
+	}
+	req := requestFromLLMBase(ctx, r)
+	req.Messages = lo.Map(r.Messages, func(m llm.Message, _ int) Message {
+		message := MessageFromLLMWithConfig(m, reasoningField)
+		// Tool call indexes identify positions within one assistant request
+		// message. Normalize history here without rewriting response deltas,
+		// whose indexes must remain stable across streaming chunks.
+		for index := range message.ToolCalls {
+			message.ToolCalls[index].Index = index
+		}
+		return message
+	})
+	req.Messages = mergeSystemMessages(req.Messages)
+	req.Tools = lo.FilterMap(r.Tools, func(tool llm.Tool, _ int) (Tool, bool) {
+		return ToolFromLLM(tool), tool.Type == llm.ToolTypeFunction
+	})
+	if r.ToolChoice != nil {
+		req.ToolChoice = &ToolChoice{ToolChoice: r.ToolChoice.ToolChoice}
+		if r.ToolChoice.NamedToolChoice != nil {
+			req.ToolChoice.NamedToolChoice = &NamedToolChoice{
+				Type: r.ToolChoice.NamedToolChoice.Type,
+				Function: ToolFunction{
+					Name: r.ToolChoice.NamedToolChoice.Function.Name,
+				},
+			}
+		}
+	}
+	if len(req.Tools) == 0 {
+		req.ParallelToolCalls = nil
+	}
+	return req, nil
+}
+
+// RequestFromLLMWithResponsesTools converts a request while retaining metadata
+// needed to restore Responses-only tool calls. Provider-specific Chat codecs use
+// this path when they advertise Responses chat-tool lifecycle support.
+func RequestFromLLMWithResponsesTools(
+	ctx context.Context,
+	r *llm.Request,
+	reasoningField ReasoningField,
+) (*Request, map[string]any, error) {
+	if r == nil {
+		return nil, nil, nil
+	}
+	if !isResponsesAPIFormat(r.APIFormat) {
+		req, err := requestFromLLM(ctx, r, reasoningField)
+		return req, nil, err
+	}
+	if r.TransformOptions.DisableResponsesChatCompat {
+		req, err := requestFromLLM(ctx, r, reasoningField)
+		return req, nil, err
 	}
 
+	req, adapter, err := requestFromLLMWithResponsesToolAdapterContext(ctx, r, reasoningField)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", transformer.ErrInvalidRequest, err)
+	}
+	if adapter == nil {
+		return req, nil, nil
+	}
+
+	return req, responsesChatToolMetadata(r.TransformerMetadata, adapter), nil
+}
+
+func responsesChatToolMetadata(existing map[string]any, adapter *responsesChatToolAdapter) map[string]any {
+	if adapter == nil {
+		return maps.Clone(existing)
+	}
+
+	metadata := make(map[string]any, len(existing)+4)
+	maps.Copy(metadata, existing)
+	metadata[responsesChatStrictFinishMetadataKey] = true
+	if mappings := adapter.mappings(); len(mappings) > 0 {
+		metadata[ResponsesChatToolMappingsMetadataKey] = mappings
+	}
+	if catalog := adapter.catalog(); len(catalog) > 0 {
+		metadata[ResponsesChatToolCatalogMetadataKey] = catalog
+	}
+	if len(adapter.warnings) > 0 {
+		metadata[responsesChatToolWarningsMetadataKey] = append([]string(nil), adapter.warnings...)
+	}
+	return metadata
+}
+
+// requestFromLLMBase converts fields shared by plain and Responses-adapted Chat requests.
+func requestFromLLMBase(ctx context.Context, r *llm.Request) *Request {
 	req := &Request{
 		Model:               r.Model,
 		FrequencyPenalty:    r.FrequencyPenalty,
@@ -51,68 +172,81 @@ func RequestFromLLM(ctx context.Context, r *llm.Request, reasoningField Reasonin
 		}
 	}
 
-	// Convert messages
-	req.Messages = lo.Map(r.Messages, func(m llm.Message, _ int) Message {
-		return MessageFromLLMWithConfig(m, reasoningField)
-	})
-
-	// Chat Completions accepts a single system message; strict OpenAI-compatible
-	// upstreams (notably domestic model gateways) reject the multiples that
-	// Claude Code produces when it sends the system prompt as an array. Merge
-	// them, mirroring the Responses outbound which folds system messages into a
-	// single `instructions` string.
-	req.Messages = mergeSystemMessages(req.Messages)
-
-	// Convert Stop
 	if r.Stop != nil {
-		req.Stop = &Stop{
-			Stop:         r.Stop.Stop,
-			MultipleStop: r.Stop.MultipleStop,
-		}
+		req.Stop = &Stop{Stop: r.Stop.Stop, MultipleStop: r.Stop.MultipleStop}
 	}
-
-	// Convert StreamOptions
 	if r.StreamOptions != nil {
-		req.StreamOptions = &StreamOptions{
-			IncludeUsage: r.StreamOptions.IncludeUsage,
-		}
+		req.StreamOptions = &StreamOptions{IncludeUsage: r.StreamOptions.IncludeUsage}
 	}
-
-	// Convert Tools – only include function tools; other types
-	// (image_generation, responses_custom_tool, etc.) are not supported
-	// by the Chat Completions API and must be filtered out.
-	req.Tools = lo.FilterMap(r.Tools, func(t llm.Tool, _ int) (Tool, bool) {
-		return ToolFromLLM(t), t.Type == llm.ToolTypeFunction
-	})
-
-	// Convert ToolChoice
-	if r.ToolChoice != nil {
-		req.ToolChoice = &ToolChoice{
-			ToolChoice: r.ToolChoice.ToolChoice,
-		}
-		if r.ToolChoice.NamedToolChoice != nil {
-			req.ToolChoice.NamedToolChoice = &NamedToolChoice{
-				Type: r.ToolChoice.NamedToolChoice.Type,
-				Function: ToolFunction{
-					Name: r.ToolChoice.NamedToolChoice.Function.Name,
-				},
-			}
-		}
-	}
-
-	// Convert ResponseFormat
 	if r.ResponseFormat != nil {
 		req.ResponseFormat = &ResponseFormat{
-			Type:       r.ResponseFormat.Type,
-			JSONSchema: r.ResponseFormat.JSONSchema,
+			Type: r.ResponseFormat.Type, JSONSchema: r.ResponseFormat.JSONSchema,
 		}
+	}
+	return req
+}
+
+// requestFromLLMWithResponsesToolAdapter converts a request and preserves reversible tool mappings.
+// It is retained for package-local callers that do not need session-derived fields.
+func requestFromLLMWithResponsesToolAdapter(r *llm.Request, reasoningField ReasoningField) (*Request, *responsesChatToolAdapter, error) {
+	return requestFromLLMWithResponsesToolAdapterContext(context.Background(), r, reasoningField)
+}
+
+func requestFromLLMWithResponsesToolAdapterContext(ctx context.Context, r *llm.Request, reasoningField ReasoningField) (*Request, *responsesChatToolAdapter, error) {
+	if r == nil {
+		return nil, nil, nil
+	}
+	toolAdapter := newResponsesChatToolAdapter(r.Tools)
+	degradedToolChoice := toolAdapter.degradeUnsupportedRawToolSelector(r)
+
+	req := requestFromLLMBase(ctx, r)
+
+	// Build the callable catalog before converting history so specialized calls
+	// resolve through the same stable names as the current tool declarations.
+	req.Tools = toolAdapter.filterAllowedTools(toolAdapter.convertTools(r.Tools), r.ToolChoice)
+
+	// Convert messages. Responses can retain assistant-only metadata such as
+	// encrypted reasoning or compaction items that Chat Completions cannot
+	// represent. Once those fields are stripped, omit the empty assistant
+	// message instead of sending an invalid history entry to the provider.
+	droppedEmptyAssistants := 0
+	req.Messages = lo.FilterMap(r.Messages, func(m llm.Message, _ int) (Message, bool) {
+		converted := toolAdapter.convertMessage(m, reasoningField)
+		if !hasChatAssistantPayload(converted) {
+			droppedEmptyAssistants++
+			return Message{}, false
+		}
+		return converted, true
+	})
+	req.Messages = mergeSystemMessages(req.Messages)
+	if droppedEmptyAssistants > 0 {
+		toolAdapter.addWarningf(
+			"empty_assistant_message: dropped %d history message(s) with no Chat-compatible payload",
+			droppedEmptyAssistants,
+		)
+	}
+
+	// Convert ToolChoice
+	if !degradedToolChoice {
+		req.ToolChoice = toolAdapter.convertToolChoice(r.ToolChoice)
 	}
 
 	if len(req.Tools) == 0 {
 		req.ParallelToolCalls = nil
+		if req.ToolChoice != nil && req.ToolChoice.ToolChoice != nil {
+			switch *req.ToolChoice.ToolChoice {
+			case "auto", "none":
+				req.ToolChoice = nil
+			case "required":
+				toolAdapter.setError(fmt.Errorf("unsupported_tool_choice: required tool choice has no callable tools after Responses-to-Chat conversion"))
+			}
+		}
 	}
 
-	return req
+	if toolAdapter.err != nil {
+		return nil, toolAdapter, toolAdapter.err
+	}
+	return req, toolAdapter, nil
 }
 
 // mergeSystemMessages collapses all system-role messages into one at the
@@ -183,12 +317,28 @@ func messageTextParts(m Message) []string {
 
 // MessageFromLLM creates OpenAI Message from unified llm.Message.
 // Defaults to ReasoningFieldAll to preserve both reasoning fields.
+//
+// MessageFromLLM serves the response direction: the payload heads back to the
+// client, so empty assistant content keeps the historical empty string, which
+// client-side content accumulators treat as no content.
 func MessageFromLLM(m llm.Message) Message {
-	return MessageFromLLMWithConfig(m, ReasoningFieldAll)
+	return messageFromLLM(m, ReasoningFieldAll, false)
 }
 
 // MessageFromLLMWithConfig creates OpenAI Message from unified llm.Message with reasoning field configuration.
+//
+// MessageFromLLMWithConfig serves the request direction: the payload heads to
+// an upstream provider, so assistant turns get the LiteLLM sanitization marker
+// stripped and content-less ones take emptyAssistantContentPlaceholder.
 func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Message {
+	return messageFromLLM(m, reasoningField, true)
+}
+
+// messageFromLLM converts a unified message into an OpenAI message.
+// forUpstreamRequest selects the request-direction content rules: strip the
+// LiteLLM sanitization marker from assistant turns and substitute
+// emptyAssistantContentPlaceholder for content-less ones.
+func messageFromLLM(m llm.Message, reasoningField ReasoningField, forUpstreamRequest bool) Message {
 	var reasoningContent, reasoning *string
 
 	// Apply reasoning field configuration
@@ -249,6 +399,22 @@ func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Mess
 	// Convert Content
 	msg.Content = MessageContentFromLLM(m.Content)
 
+	// Chat Completions accepts a string for the tool role; a multi-part tool
+	// result (e.g. a Responses function_call_output with several text items)
+	// would otherwise serialize as an array and be rejected with a 400.
+	if m.Role == "tool" {
+		msg.Content = flattenChatToolContent(msg.Content)
+	}
+
+	// LiteLLM-family gateways rewrite blank message content into a fixed
+	// sanitization marker, which the model then copies into its own output.
+	// Normalize assistant turns so no blank content reaches such a gateway, and
+	// strip the marker itself from history replayed through one. User turns
+	// keep their text: a user may quote the marker on purpose.
+	if forUpstreamRequest && msg.Role == "assistant" {
+		msg.Content = normalizeAssistantRequestContent(msg.Content)
+	}
+
 	// Convert ToolCalls
 	if m.ToolCalls != nil {
 		msg.ToolCalls = lo.Map(m.ToolCalls, func(tc llm.ToolCall, _ int) ToolCall {
@@ -256,14 +422,25 @@ func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Mess
 		})
 	}
 
-	// An assistant turn that only requests tool calls has no content to send, and
-	// a message whose parts were all filtered out (e.g. compaction) is left with an
-	// empty part list. Both cases would reach the wire as a missing or null content
-	// field, which the OpenAI spec permits but stricter OpenAI-compatible upstreams
-	// reject because their schema only accepts a string or an array. Normalize to an
-	// empty string, which every implementation accepts and OpenAI treats as no content.
-	if len(msg.ToolCalls) > 0 && msg.Content.Content == nil && len(msg.Content.MultipleContent) == 0 {
-		msg.Content = MessageContent{Content: lo.ToPtr("")}
+	// Assistant turns can carry no content: turns that only request tool calls,
+	// turns that only carry reasoning (a Responses reasoning item not followed by
+	// text or a call), and messages whose parts were all filtered out (e.g.
+	// compaction, or a stripped sanitization marker) are left with an empty part
+	// list. These cases would reach the wire as a missing or null content field,
+	// which the OpenAI spec permits but stricter OpenAI-compatible upstreams
+	// reject because their schema only accepts a string or an array.
+	//
+	// Requests headed upstream take emptyAssistantContentPlaceholder, because a
+	// blank string would be rewritten by LiteLLM-family gateways into their
+	// sanitization marker. Responses headed back to the client keep the empty
+	// string, which every implementation accepts and client-side accumulators
+	// treat as no content.
+	if msg.Role == "assistant" && msg.Content.Content == nil && len(msg.Content.MultipleContent) == 0 {
+		placeholder := ""
+		if forUpstreamRequest {
+			placeholder = emptyAssistantContentPlaceholder
+		}
+		msg.Content = MessageContent{Content: lo.ToPtr(placeholder)}
 	}
 
 	// Convert Annotations
@@ -309,6 +486,60 @@ func MessageContentFromLLM(c llm.MessageContent) MessageContent {
 				return MessageContentPartFromLLM(p), true
 			}
 		})
+	}
+
+	return content
+}
+
+// normalizeAssistantRequestContent removes the assistant content shapes that a
+// LiteLLM-family gateway would rewrite into litellmSanitizedEmptyContentMarker,
+// so the model never receives that protocol text. Two sources produce such
+// content, and both are treated as no content:
+//
+//  1. blank text — an empty or whitespace-only scalar content, and text parts
+//     whose text is nil or whitespace-only;
+//  2. the sanitization marker itself, replayed as history from a gateway that
+//     had already rewritten blank content into it.
+//
+// Text is compared trimmed so surrounding whitespace added by intermediate
+// proxies does not defeat the check, and parts are examined after
+// MessageContentFromLLM has dropped the types Chat Completions cannot
+// represent. The caller turns an emptied content into
+// emptyAssistantContentPlaceholder. MessageContent marshals MultipleContent in
+// preference to Content, so a scalar sitting next to a part list is dead
+// weight: when every part is dropped, the scalar is cleared too rather than
+// resurfacing as visible content.
+func normalizeAssistantRequestContent(content MessageContent) MessageContent {
+	if content.Content != nil {
+		trimmed := strings.TrimSpace(*content.Content)
+		if trimmed == "" || trimmed == litellmSanitizedEmptyContentMarker {
+			content.Content = nil
+		}
+	}
+
+	if len(content.MultipleContent) > 0 {
+		content.MultipleContent = lo.FilterMap(content.MultipleContent, func(p MessageContentPart, _ int) (MessageContentPart, bool) {
+			if p.Type != "text" {
+				return p, true
+			}
+			if p.Text == nil {
+				return MessageContentPart{}, false
+			}
+
+			trimmed := strings.TrimSpace(*p.Text)
+			if trimmed == "" || trimmed == litellmSanitizedEmptyContentMarker {
+				return MessageContentPart{}, false
+			}
+
+			return p, true
+		})
+
+		// The list is the authoritative representation for this turn, so a
+		// scalar that marshaling already ignored must not resurface once every
+		// part has been dropped.
+		if len(content.MultipleContent) == 0 {
+			content.Content = nil
+		}
 	}
 
 	return content
@@ -385,6 +616,27 @@ func normalizeContentPartType(partType string) string {
 	default:
 		return partType
 	}
+}
+
+// flattenChatToolContent collapses a Chat tool message's content into a single
+// string. Text parts are concatenated in order; parts a Chat tool message
+// cannot carry (e.g. images) are dropped, which still beats emitting an array
+// that the provider rejects outright.
+func flattenChatToolContent(content MessageContent) MessageContent {
+	if len(content.MultipleContent) == 0 {
+		return content
+	}
+
+	var builder strings.Builder
+	for _, part := range content.MultipleContent {
+		if part.Type == "text" && part.Text != nil {
+			builder.WriteString(*part.Text)
+		}
+	}
+
+	text := builder.String()
+
+	return MessageContent{Content: &text}
 }
 
 // ToolFromLLM creates OpenAI Tool from unified llm.Tool.

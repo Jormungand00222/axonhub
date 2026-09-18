@@ -538,7 +538,14 @@ func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, ll
 		}
 		llmRequest = transformedRequest
 	}
-	llmRequest = filterResponseCustomToolMessagesForNonResponsesOutbound(llmRequest, outboundFormat)
+	llmRequest, filterErr := filterResponsesChatToolMessagesForOutboundWithCompat(
+		llmRequest,
+		p.wrapped,
+		channelEnablesResponsesChatCompat(candidate),
+	)
+	if filterErr != nil {
+		return nil, filterErr
+	}
 
 	if shouldForceStreamingForCandidate(candidate, llmRequest) {
 		streamPtr := lo.ToPtr(true)
@@ -568,38 +575,79 @@ func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, ll
 	return httpRequest, nil
 }
 
-func filterResponseCustomToolMessagesForNonResponsesOutbound(
+func filterResponsesChatToolMessagesForOutbound(
 	llmRequest *llm.Request,
-	outboundFormat llm.APIFormat,
-) *llm.Request {
+	outbound transformer.Outbound,
+) (*llm.Request, error) {
+	return filterResponsesChatToolMessagesForOutboundWithCompat(
+		llmRequest,
+		outbound,
+		llmRequest == nil || !llmRequest.TransformOptions.DisableResponsesChatCompat,
+	)
+}
+
+func filterResponsesChatToolMessagesForOutboundWithCompat(
+	llmRequest *llm.Request,
+	outbound transformer.Outbound,
+	compatEnabled bool,
+) (*llm.Request, error) {
 	if llmRequest == nil {
-		return nil
+		return nil, nil
 	}
 
-	if !isResponsesFormat(llmRequest.APIFormat) || isResponsesFormat(outboundFormat) || !containsResponseCustomToolMessages(llmRequest.Messages) {
-		return llmRequest
+	if !isResponsesFormat(llmRequest.APIFormat) || outbound == nil {
+		return llmRequest, nil
+	}
+	capabilities := transformer.ResponsesRequestCapabilitiesOf(outbound, llmRequest)
+	if capabilities.NativeResponses {
+		return llmRequest, nil
+	}
+	if !compatEnabled {
+		cloned := *llmRequest
+		cloned.TransformOptions.DisableResponsesChatCompat = true
+		cloned.Messages = shared.FilterOutResponseCustomToolMessages(llmRequest.Messages)
+		return &cloned, nil
 	}
 
-	cloned := *llmRequest
-	cloned.Messages = shared.FilterOutResponseCustomToolMessages(llmRequest.Messages)
+	if llmRequest.PreviousResponseID != nil {
+		return nil, fmt.Errorf(
+			"%w: previous_response_id requires a native Responses outbound because fallback channels cannot preserve Responses history",
+			transformer.ErrInvalidRequest,
+		)
+	}
 
-	return &cloned
+	// Truncated streams can leave clients replaying tool-call arguments that
+	// are not valid JSON. Repair them only for Chat outbounds; native
+	// Responses replays preserve the original protocol history.
+	if sanitized, changed := shared.SanitizeChatToolArguments(llmRequest.Messages); changed {
+		cloned := *llmRequest
+		cloned.Messages = sanitized
+		llmRequest = &cloned
+	}
+
+	// Interrupted turns leave empty output items in client history. Strict
+	// Chat providers reject the replayed empty content, so drop or substitute
+	// it before any Chat conversion. Responses-native replays keep fidelity.
+	if sanitized, changed := shared.SanitizeChatMessageContent(llmRequest.Messages); changed {
+		cloned := *llmRequest
+		cloned.Messages = sanitized
+		llmRequest = &cloned
+	}
+
+	if capabilities.ChatToolLifecycle {
+		return llmRequest, nil
+	}
+
+	return shared.DowngradeResponsesChatToolLifecycle(llmRequest)
+}
+
+func channelEnablesResponsesChatCompat(candidate *ChannelModelsCandidate) bool {
+	return candidate != nil && candidate.Channel != nil && candidate.Channel.Settings != nil &&
+		candidate.Channel.Settings.TransformOptions.EnableResponsesChatCompat
 }
 
 func isResponsesFormat(format llm.APIFormat) bool {
-	return format == llm.APIFormatOpenAIResponse || format == llm.APIFormatOpenAIResponseCompact
-}
-
-func containsResponseCustomToolMessages(messages []llm.Message) bool {
-	for _, msg := range messages {
-		for _, toolCall := range msg.ToolCalls {
-			if toolCall.Type == llm.ToolTypeResponsesCustomTool || toolCall.ResponseCustomToolCall != nil {
-				return true
-			}
-		}
-	}
-
-	return false
+	return llm.IsOpenAIResponsesFormat(format)
 }
 
 func (p *PersistentOutboundTransformer) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {

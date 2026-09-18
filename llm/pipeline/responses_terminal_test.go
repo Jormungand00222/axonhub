@@ -59,8 +59,7 @@ func TestPipeline_ResponsesDisconnectAfterTerminalPreservesOutcome(t *testing.T)
 			name: "failed", eventType: "response.failed", status: "failed", expectedType: responsestransformer.StreamEventTypeResponseFailed,
 			errorDetail: &responsestransformer.Error{Type: "server_error", Code: "provider_error", Message: "provider failed", Param: "model"},
 		},
-		// Cancellation remains compatible with the existing downstream format.
-		{name: "cancelled", eventType: "response.cancelled", status: "cancelled", expectedType: responsestransformer.StreamEventTypeResponseCompleted},
+		{name: "cancelled", eventType: "response.cancelled", status: "cancelled", expectedType: responsestransformer.StreamEventTypeResponseCancelled},
 		{
 			name: "completed with failed status", eventType: "response.completed", status: "failed", expectedType: responsestransformer.StreamEventTypeResponseFailed,
 			errorDetail: &responsestransformer.Error{Code: "provider_error", Message: "provider failed"},

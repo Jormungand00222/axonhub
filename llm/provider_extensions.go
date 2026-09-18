@@ -16,9 +16,10 @@ type OpenAIResponsesRequestExtensions struct {
 	ReasoningContext string                       `json:"-"`
 	RawFields        map[string]json.RawMessage   `json:"-"`
 	RawTools         []OpenAIResponsesRawFragment `json:"-"`
-	ToolSignatures   []string                     `json:"-"`
 	RawToolChoice    json.RawMessage              `json:"-"`
 	RawInputItems    []OpenAIResponsesRawFragment `json:"-"`
+	RawInputMessages []string                     `json:"-"`
+	RawInputTools    []string                     `json:"-"`
 }
 
 type OpenAIResponsesRawFragment struct {
@@ -60,9 +61,10 @@ func CloneProviderExtensions(src *ProviderExtensions) *ProviderExtensions {
 				ReasoningContext: src.OpenAIResponses.Request.ReasoningContext,
 				RawFields:        cloneRawMessageMap(src.OpenAIResponses.Request.RawFields),
 				RawTools:         cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawTools),
-				ToolSignatures:   append([]string(nil), src.OpenAIResponses.Request.ToolSignatures...),
 				RawToolChoice:    cloneRawMessage(src.OpenAIResponses.Request.RawToolChoice),
 				RawInputItems:    cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawInputItems),
+				RawInputMessages: append([]string(nil), src.OpenAIResponses.Request.RawInputMessages...),
+				RawInputTools:    append([]string(nil), src.OpenAIResponses.Request.RawInputTools...),
 			}
 		}
 	}
