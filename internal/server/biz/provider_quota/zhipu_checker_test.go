@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -14,6 +15,92 @@ import (
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func TestZhipu_CheckQuota_CreditPlan(t *testing.T) {
+	// Shape returned by the Coding Plan endpoint, with future reset timestamps.
+	const body = `{"code":200,"msg":"Operation successful","data":{"limits":[
+		{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":7391,"remaining":20608,"percentage":26,"nextResetTime":4087947600000},
+		{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":19137,"remaining":120862,"percentage":13,"nextResetTime":4088534400000}
+	],"level":"max"},"success":true}`
+	for _, channelType := range []channel.Type{channel.TypeZhipu, channel.TypeZhipuAnthropic} {
+		t.Run(string(channelType), func(t *testing.T) {
+			client := httpclient.NewHttpClientWithClient(&http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					require.Equal(t, http.MethodGet, req.Method)
+					require.Equal(t, "https://open.bigmodel.cn/api/monitor/usage/quota/limit", req.URL.String())
+					require.Equal(t, "test-key", req.Header.Get("Authorization"))
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				}),
+			})
+			quota, err := NewZhipuQuotaChecker(client).CheckQuota(context.Background(), &ent.Channel{
+				Type: channelType, Credentials: objects.ChannelCredentials{APIKey: "test-key"},
+			})
+			require.NoError(t, err)
+			require.Equal(t, "zhipu", quota.ProviderType)
+			require.Equal(t, "available", quota.Status)
+			require.True(t, quota.Ready)
+			require.Equal(t, "max", quota.RawData["level"])
+			require.Len(t, quota.Limits, 2)
+			for i, expected := range []struct {
+				window string
+				ratio  float64
+				reset  int64
+				period time.Duration
+			}{
+				{QuotaWindow5h, .26, 4087947600000, 5 * time.Hour},
+				{QuotaWindowWeekly, .13, 4088534400000, 7 * 24 * time.Hour},
+			} {
+				limit := quota.Limits[i]
+				require.Equal(t, expected.window, limit.Window)
+				require.InDelta(t, expected.ratio, limit.UsageRatio, .0001)
+				require.Equal(t, expected.reset, limit.NextResetAt.UnixMilli())
+				require.Equal(t, expected.period, limit.NextResetAt.Sub(*limit.PeriodStart))
+			}
+			rows := quota.RawData["rows"].([]zhipuWindowRow)
+			require.Equal(t, "five_hour", rows[0].Window)
+			require.Equal(t, "weekly_limit", rows[1].Window)
+		})
+	}
+}
+
+func TestZhipuFamily_ExplicitPeriods(t *testing.T) {
+	for _, provider := range []string{"zhipu", "zai"} {
+		for _, limitType := range []string{"CREDIT_LIMIT", "TOKENS_LIMIT"} {
+			t.Run(provider+"/"+limitType, func(t *testing.T) {
+				// Weekly comes first and omits reset time; metadata must take
+				// precedence over both ordering and the legacy reset heuristic.
+				body := `{"success":true,"data":{"limits":[
+					{"type":"LIMIT_TYPE","unit":6,"number":1,"percentage":100},
+					{"type":"LIMIT_TYPE","unit":3,"number":5,"percentage":85,"nextResetTime":4088534400000},
+					{"type":"TIME_LIMIT","percentage":100}
+				]}}`
+				quota, err := parseZhipuFamilyQuotaResponse([]byte(strings.ReplaceAll(body, "LIMIT_TYPE", limitType)), provider)
+				require.NoError(t, err)
+				require.Equal(t, provider, quota.ProviderType)
+				require.Equal(t, "exhausted", quota.Status)
+				require.False(t, quota.Ready)
+				require.Len(t, quota.Limits, 2)
+				require.Equal(t, QuotaWindow5h, quota.Limits[0].Window)
+				require.Equal(t, "warning", quota.Limits[0].Status)
+				require.Equal(t, QuotaWindowWeekly, quota.Limits[1].Window)
+				require.Equal(t, "exhausted", quota.Limits[1].Status)
+			})
+		}
+	}
+
+	t.Run("weekly only", func(t *testing.T) {
+		quota, err := parseZhipuQuotaResponse([]byte(`{"success":true,"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"percentage":13}]}}`))
+		require.NoError(t, err)
+		require.Len(t, quota.Limits, 1)
+		require.Equal(t, QuotaWindowWeekly, quota.Limits[0].Window)
+		require.Equal(t, "weekly_limit", quota.RawData["rows"].([]zhipuWindowRow)[0].Window)
+	})
+
+	t.Run("unknown period", func(t *testing.T) {
+		_, err := parseZhipuQuotaResponse([]byte(`{"success":true,"data":{"limits":[{"type":"CREDIT_LIMIT","unit":99,"number":1,"percentage":13}]}}`))
+		require.ErrorContains(t, err, "unsupported zhipu quota period")
+	})
+}
 
 func TestZhipu_CheckQuota_HappyPath(t *testing.T) {
 	httpClient := httpclient.NewHttpClientWithClient(&http.Client{

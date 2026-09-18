@@ -29,6 +29,8 @@ type zhipuQuotaData struct {
 
 type zhipuLimitEntry struct {
 	Type          string  `json:"type"`
+	Unit          int     `json:"unit"`
+	Number        int     `json:"number"`
 	Percentage    float64 `json:"percentage"`
 	NextResetTime *int64  `json:"nextResetTime,omitempty"`
 }
@@ -132,21 +134,21 @@ func parseZhipuFamilyQuotaResponse(body []byte, providerType string) (QuotaData,
 		return QuotaData{}, fmt.Errorf("zhipu quota response contains no data")
 	}
 
-	// Filter for TOKENS_LIMIT entries only.
+	// Coding Plan now reports CREDIT_LIMIT; older plans and Z.ai can still
+	// report TOKENS_LIMIT. TIME_LIMIT describes separate tool usage.
 	var tokenLimits []zhipuLimitEntry
 	for _, entry := range response.Data.Limits {
-		if strings.EqualFold(entry.Type, "TOKENS_LIMIT") {
+		if strings.EqualFold(entry.Type, "TOKENS_LIMIT") || strings.EqualFold(entry.Type, "CREDIT_LIMIT") {
 			tokenLimits = append(tokenLimits, entry)
 		}
 	}
 
 	if len(tokenLimits) == 0 {
-		return QuotaData{}, fmt.Errorf("zhipu quota response contains no TOKENS_LIMIT entries")
+		return QuotaData{}, fmt.Errorf("zhipu quota response contains no TOKENS_LIMIT or CREDIT_LIMIT entries")
 	}
 
-	// The entry without nextResetTime is always the 5-hour bucket (the rolling
-	// 5h window reports no reset time at 0% usage). When all entries have a
-	// reset time, trust API return order: index 0 → five_hour, index 1 → weekly.
+	// Prefer explicit period metadata. Older responses omit it, so preserve
+	// the legacy ordering fallback for those responses.
 	windowNames := []string{"five_hour", "weekly_limit"}
 	windowLabels := []string{QuotaWindow5h, QuotaWindowWeekly}
 	windowLengths := []time.Duration{5 * time.Hour, 7 * 24 * time.Hour}
@@ -158,11 +160,22 @@ func parseZhipuFamilyQuotaResponse(body []byte, providerType string) (QuotaData,
 	rows := make([]zhipuWindowRow, 0, min(len(ordered), len(windowNames)))
 
 	for i, entry := range ordered {
-		if i >= len(windowNames) {
+		windowIndex := i
+		if entry.Unit != 0 || entry.Number != 0 {
+			switch {
+			case entry.Unit == 3 && entry.Number == 5: // hours
+				windowIndex = 0
+			case entry.Unit == 6 && entry.Number == 1: // weeks
+				windowIndex = 1
+			default:
+				return QuotaData{}, fmt.Errorf("unsupported zhipu quota period: unit=%d number=%d", entry.Unit, entry.Number)
+			}
+		}
+		if windowIndex >= len(windowNames) {
 			break
 		}
 
-		windowName := windowNames[i]
+		windowName := windowNames[windowIndex]
 		usedPercent := entry.Percentage
 		ratio := usedPercent / 100.0
 		status := zhipuStatusForRatio(ratio)
@@ -177,7 +190,7 @@ func parseZhipuFamilyQuotaResponse(body []byte, providerType string) (QuotaData,
 		}
 
 		limits = append(limits, NewTokenLimitStatus(status, ratio, resetAt).
-			WithWindow(windowLabels[i], windowLengths[i]))
+			WithWindow(windowLabels[windowIndex], windowLengths[windowIndex]))
 		overallStatus = worseZhipuStatus(overallStatus, status)
 
 		var resetAtStr *string
@@ -227,19 +240,19 @@ func worseZhipuStatus(a, b string) string {
 	return a
 }
 
-// orderZhipuBuckets returns the TOKENS_LIMIT entries ordered so the 5-hour
-// bucket comes first. A bucket without nextResetTime is the 5-hour bucket
-// (the rolling 5h window omits reset time at 0% usage). If all buckets have
-// a reset time, the API return order is trusted.
+// orderZhipuBuckets puts explicit 5-hour buckets first and weekly buckets last.
+// For legacy entries without period metadata, a missing reset time identifies
+// the 5-hour bucket; otherwise the API return order is preserved.
 func orderZhipuBuckets(entries []zhipuLimitEntry) []zhipuLimitEntry {
-	var withoutReset []zhipuLimitEntry
-	var withReset []zhipuLimitEntry
+	var firstBuckets []zhipuLimitEntry
+	var remainingBuckets []zhipuLimitEntry
 	for _, e := range entries {
-		if e.NextResetTime == nil || *e.NextResetTime <= 0 {
-			withoutReset = append(withoutReset, e)
+		if (e.Unit == 3 && e.Number == 5) ||
+			(e.Unit == 0 && e.Number == 0 && (e.NextResetTime == nil || *e.NextResetTime <= 0)) {
+			firstBuckets = append(firstBuckets, e)
 		} else {
-			withReset = append(withReset, e)
+			remainingBuckets = append(remainingBuckets, e)
 		}
 	}
-	return append(withoutReset, withReset...)
+	return append(firstBuckets, remainingBuckets...)
 }
