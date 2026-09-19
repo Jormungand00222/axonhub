@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/samber/lo"
@@ -2015,6 +2016,32 @@ func TestBuildReasoningItems_OmitsEmptyEncryptedContent(t *testing.T) {
 	require.Len(t, items, 1)
 	require.Equal(t, "rs_summary", items[0].ID)
 	require.Nil(t, items[0].EncryptedContent)
+}
+
+func TestConvertToResponsesAPIResponse_GeneratesTypedReplayableItemIDs(t *testing.T) {
+	resp := convertToResponsesAPIResponse(&llm.Response{
+		ID:    "chatcmpl_typed_ids",
+		Model: "glm-5.3",
+		Choices: []llm.Choice{{
+			Message: &llm.Message{
+				ID:               "item_chat_message",
+				Role:             "assistant",
+				ReasoningContent: lo.ToPtr("thinking"),
+				Content:          llm.MessageContent{Content: lo.ToPtr("answer")},
+			},
+		}},
+	})
+
+	require.Len(t, resp.Output, 2)
+	require.Equal(t, "reasoning", resp.Output[0].Type)
+	require.True(t, strings.HasPrefix(resp.Output[0].ID, "rs_"))
+	require.Equal(t, "message", resp.Output[1].Type)
+	require.True(t, strings.HasPrefix(resp.Output[1].ID, "msg_"))
+}
+
+func TestEnsureResponseItemID_PreservesMatchingProviderID(t *testing.T) {
+	require.Equal(t, "rs_provider", ensureResponseItemID("rs_provider", "rs"))
+	require.Equal(t, "msg_provider", ensureResponseItemID("msg_provider", "msg"))
 }
 
 func TestInboundTransformer_TransformRequest_WithReasoningInput(t *testing.T) {

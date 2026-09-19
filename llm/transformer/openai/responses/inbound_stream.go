@@ -681,10 +681,7 @@ func (s *responsesInboundStream) ensureReasoningItemStarted(sourceID string) err
 	s.hasReasoningSummaryPart = false
 	s.currentReasoningSourceID = sourceID
 
-	s.currentItemID = sourceID
-	if s.currentItemID == "" {
-		s.currentItemID = generateItemID()
-	}
+	s.currentItemID = ensureResponseItemID(sourceID, "rs")
 	item := &Item{
 		ID:      s.currentItemID,
 		Type:    "reasoning",
@@ -720,7 +717,7 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 	if !s.hasMessageItemStarted {
 		s.hasMessageItemStarted = true
 
-		s.currentItemID = generateItemID()
+		s.currentItemID = generateResponseItemID("msg")
 
 		err := s.enqueueEvent(&StreamEvent{
 			Type:        StreamEventTypeOutputItemAdded,

@@ -1386,10 +1386,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 			continue
 		}
 
-		messageItemID := message.ID
-		if messageItemID == "" {
-			messageItemID = generateItemID()
-		}
+		messageItemID := ensureResponseItemID(message.ID, "msg")
 
 		// Handle reasoning content. A message may carry multiple independently
 		// signed reasoning items, each of which must remain a separate Responses
@@ -1531,7 +1528,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		emptyText := ""
 		resp.Output = []Item{
 			{
-				ID:   generateItemID(),
+				ID:   generateResponseItemID("msg"),
 				Type: "message",
 				Role: "assistant",
 				Content: &Input{
@@ -1554,6 +1551,26 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 // generateItemID generates a unique item ID for output items.
 func generateItemID() string {
 	return fmt.Sprintf("item_%s", lo.RandomString(16, lo.AlphanumericCharset))
+}
+
+// generateResponseItemID creates an ID with the type-specific prefix required
+// by the Responses API. In particular, replayed message and reasoning items
+// are rejected by native OpenAI Responses endpoints when their IDs use the
+// generic item_ prefix.
+func generateResponseItemID(prefix string) string {
+	return fmt.Sprintf("%s_%s", prefix, lo.RandomString(16, lo.AlphanumericCharset))
+}
+
+// ensureResponseItemID preserves provider IDs that already use the expected
+// Responses prefix and replaces missing or cross-format IDs with a compliant
+// synthetic ID. Chat providers may expose message/reasoning IDs that are valid
+// internally but invalid when Codex replays them as Responses items.
+func ensureResponseItemID(id, prefix string) string {
+	if strings.HasPrefix(id, prefix+"_") {
+		return id
+	}
+
+	return generateResponseItemID(prefix)
 }
 
 // buildReasoningItems creates reasoning Items from a message. ReasoningItems
@@ -1582,10 +1599,7 @@ func buildReasoningItems(msg llm.Message) []Item {
 			})
 		}
 
-		itemID := reasoningItem.ID
-		if itemID == "" {
-			itemID = generateItemID()
-		}
+		itemID := ensureResponseItemID(reasoningItem.ID, "rs")
 
 		item := Item{
 			ID:      itemID,

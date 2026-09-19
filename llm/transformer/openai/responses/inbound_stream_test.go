@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -256,6 +257,80 @@ func TestInboundTransformer_TransformStream_KeepsResponsesReasoningItemsSeparate
 	require.Equal(t, "gAAAA_done_1", lo.FromPtr(lastEvent.Response.Output[0].EncryptedContent))
 	require.Equal(t, "rs_2", lastEvent.Response.Output[1].ID)
 	require.Equal(t, "gAAAA_done_2", lo.FromPtr(lastEvent.Response.Output[1].EncryptedContent))
+}
+
+func TestInboundTransformer_TransformStream_GeneratesTypedReplayableItemIDs(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "chatcmpl_typed_ids",
+			Created: 1700000000,
+			Model:   "glm-5.3",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{Role: "assistant", ReasoningContent: lo.ToPtr("thinking")},
+			}},
+		},
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "chatcmpl_typed_ids",
+			Created: 1700000000,
+			Model:   "glm-5.3",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{Content: llm.MessageContent{Content: lo.ToPtr("answer")}},
+			}},
+		},
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "chatcmpl_typed_ids",
+			Created: 1700000000,
+			Model:   "glm-5.3",
+			Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{}, FinishReason: lo.ToPtr("stop")}},
+		},
+		{Object: "chat.completion.chunk", Usage: &llm.Usage{}},
+	}))
+	require.NoError(t, err)
+
+	var reasoningIDs, messageIDs []string
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		if event.Item != nil {
+			switch event.Item.Type {
+			case "reasoning":
+				reasoningIDs = append(reasoningIDs, event.Item.ID)
+			case "message":
+				messageIDs = append(messageIDs, event.Item.ID)
+			}
+		}
+		if event.ItemID != nil {
+			switch event.Type {
+			case StreamEventTypeReasoningSummaryPartAdded,
+				StreamEventTypeReasoningSummaryTextDelta,
+				StreamEventTypeReasoningSummaryTextDone,
+				StreamEventTypeReasoningSummaryPartDone:
+				reasoningIDs = append(reasoningIDs, *event.ItemID)
+			case StreamEventTypeContentPartAdded,
+				StreamEventTypeOutputTextDelta,
+				StreamEventTypeOutputTextDone,
+				StreamEventTypeContentPartDone:
+				messageIDs = append(messageIDs, *event.ItemID)
+			}
+		}
+	}
+	require.NoError(t, stream.Err())
+	require.NotEmpty(t, reasoningIDs)
+	require.NotEmpty(t, messageIDs)
+	for _, id := range reasoningIDs {
+		require.Equal(t, reasoningIDs[0], id)
+		require.True(t, strings.HasPrefix(id, "rs_"))
+	}
+	for _, id := range messageIDs {
+		require.Equal(t, messageIDs[0], id)
+		require.True(t, strings.HasPrefix(id, "msg_"))
+	}
 }
 
 func TestInboundTransformer_TransformStream_ReplacesItemScopedProvisionalSignature(t *testing.T) {
