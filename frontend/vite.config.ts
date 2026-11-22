@@ -7,6 +7,14 @@ import tanstackRouter from '@tanstack/router-plugin/vite';
 
 // https://vite.dev/config/
 export default defineConfig({
+  build: {
+    rolldownOptions: {
+      experimental: {
+        // rolldown#11068: merging common chunks can create circular route chunks.
+        chunkOptimization: { mergeCommonChunks: false },
+      },
+    },
+  },
   plugins: [
     tanstackRouter({
       target: 'react',
