@@ -10,8 +10,11 @@ export default defineConfig({
   build: {
     rolldownOptions: {
       experimental: {
-        // rolldown#11068: merging common chunks can create circular route chunks.
-        chunkOptimization: { mergeCommonChunks: false },
+        chunkOptimization: {
+          // Work around rolldown#11068: merging common chunks can create
+          // circular static imports for auto-code-split routes.
+          mergeCommonChunks: false,
+        },
       },
     },
   },
