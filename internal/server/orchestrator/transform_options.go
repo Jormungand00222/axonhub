@@ -43,6 +43,32 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 	return &newReq
 }
 
+// applyModelDefaultMaxTokens copies the catalog model output limit onto the
+// request so Anthropic outbound conversion can use it as max_tokens when the
+// client omitted an output cap. Other outbound formats leave max_tokens unset.
+func applyModelDefaultMaxTokens(req *llm.Request, candidate *ChannelModelsCandidate, outboundFormat llm.APIFormat) *llm.Request {
+	if req == nil || candidate == nil || candidate.DefaultMaxTokens <= 0 {
+		return req
+	}
+
+	if outboundFormat != llm.APIFormatAnthropicMessage {
+		return req
+	}
+
+	if req.MaxTokens != nil || req.MaxCompletionTokens != nil {
+		return req
+	}
+
+	if req.TransformOptions.DefaultMaxTokens != nil {
+		return req
+	}
+
+	newReq := *req
+	newReq.TransformOptions.DefaultMaxTokens = lo.ToPtr(candidate.DefaultMaxTokens)
+
+	return &newReq
+}
+
 // applyReasoningEffortMapping applies the channel's reasoning effort mapping to the
 // unified request before the outbound transformer runs, so the mapping affects every
 // outbound protocol (chat completions, responses, messages) uniformly, regardless of
@@ -52,8 +78,21 @@ func applyReasoningEffortMapping(req *llm.Request, channelSettings *objects.Chan
 		return req
 	}
 
-	mapped := llm.ApplyReasoningEffortMapping(req.ReasoningEffort, channelSettings.TransformOptions.ReasoningEffortMapping)
-	if mapped == req.ReasoningEffort {
+	// With thinking.type=between_tools the Anthropic inbound keeps the unified effort at
+	// "none" (thinking is off for other protocols) and records the native effort only in
+	// TransformerMetadata, so map that value instead and leave ReasoningEffort as is.
+	source := req.ReasoningEffort
+	nativeOnly := false
+	if source == llm.ReasoningEffortNone && req.TransformerMetadata != nil {
+		thinkingType, _ := req.TransformerMetadata[anthropic.TransformerMetadataKeyThinkingType].(string)
+		if effort, ok := req.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort].(string); ok && thinkingType == "between_tools" && effort != "" {
+			source = effort
+			nativeOnly = true
+		}
+	}
+
+	mapped := llm.ApplyReasoningEffortMapping(source, channelSettings.TransformOptions.ReasoningEffortMapping)
+	if mapped == source {
 		return req
 	}
 
@@ -72,7 +111,9 @@ func applyReasoningEffortMapping(req *llm.Request, channelSettings *objects.Chan
 		newReq.TransformerMetadata = metadata
 	}
 
-	newReq.ReasoningEffort = mapped
+	if !nativeOnly {
+		newReq.ReasoningEffort = mapped
+	}
 
 	return &newReq
 }

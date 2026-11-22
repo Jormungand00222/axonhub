@@ -7,10 +7,15 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { useAuthStore } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
+import { ensureFreshAccessToken } from '@/lib/auth-session';
+import { copyTextToClipboard } from '@/lib/clipboard';
+import { cn } from '@/lib/utils';
+import { usePermissions } from '@/hooks/usePermissions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -33,11 +38,7 @@ import { Response as UIResponse } from '@/components/ai-elements/response';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { useAllChannelSummarys } from '@/features/channels/data/channels';
 import { useQueryModels } from '@/features/models/data/models';
-import { usePermissions } from '@/hooks/usePermissions';
-import { copyTextToClipboard } from '@/lib/clipboard';
-import { cn } from '@/lib/utils';
-
-type PlaygroundModelSource = 'channel' | 'model_gateway';
+import { readSelection, resolveSelection, writeSelection, type PlaygroundModelSource } from './selection';
 
 function PlaygroundImageButton() {
   const { t } = useTranslation();
@@ -64,9 +65,7 @@ function PlaygroundAttachments() {
 
   return (
     <PromptInputHeader>
-      <PromptInputAttachments>
-        {(attachment) => <PromptInputAttachment data={attachment} />}
-      </PromptInputAttachments>
+      <PromptInputAttachments>{(attachment) => <PromptInputAttachment data={attachment} />}</PromptInputAttachments>
     </PromptInputHeader>
   );
 }
@@ -93,16 +92,28 @@ function PlaygroundSubmit({ input, status, onStop }: { input: string; status: Ch
 
 export default function Playground() {
   const { t } = useTranslation();
-  const [modelSource, setModelSource] = useState<PlaygroundModelSource>('channel');
-  const [selectedChannel, setSelectedChannel] = useState<string>('');
-  const [model, setModel] = useState('');
+  const selectedProjectId = useSelectedProjectId();
+  const [selectionState, setSelectionState] = useState(() => ({
+    projectId: selectedProjectId,
+    ...readSelection(selectedProjectId),
+    ready: false,
+  }));
+  // Reset during render so a project switch never renders or saves the prior project's choice.
+  const selection =
+    selectionState.projectId === selectedProjectId
+      ? selectionState
+      : { projectId: selectedProjectId, ...readSelection(selectedProjectId), ready: false };
+  if (selectionState.projectId !== selectedProjectId) setSelectionState(selection);
+  const { modelSource, selectedChannel, model } = selection;
+  const setModel = (nextModel: string) => setSelectionState((current) => ({ ...current, model: nextModel }));
   const [temperature, setTemperature] = useState(0.6);
+  const [sendTemperature, setSendTemperature] = useState(true);
   const [maxTokens, setMaxTokens] = useState(4096);
   const [systemPrompt, setSystemPrompt] = useState(t('playground.settings.defaultSystemPrompt'));
 
   // useRef hooks for direct access to current values
   const modelRef = useRef(model);
-  const temperatureRef = useRef(temperature);
+  const temperatureRef = useRef<number | undefined>(temperature);
   const maxTokensRef = useRef(maxTokens);
   const systemPromptRef = useRef(systemPrompt);
   const selectedChannelRef = useRef(selectedChannel);
@@ -114,8 +125,8 @@ export default function Playground() {
   }, [model]);
 
   useEffect(() => {
-    temperatureRef.current = temperature;
-  }, [temperature]);
+    temperatureRef.current = sendTemperature ? temperature : undefined;
+  }, [temperature, sendTemperature]);
 
   useEffect(() => {
     maxTokensRef.current = maxTokens;
@@ -134,8 +145,7 @@ export default function Playground() {
   }, [modelSource]);
 
   const { accessToken } = useAuthStore((state) => state.auth);
-  const selectedProjectId = useSelectedProjectId();
-  const { hasSystemScope } = usePermissions();
+  const { user, hasSystemScope } = usePermissions();
   const canUseModelGateway = hasSystemScope('read_channels');
 
   // 获取 channels 数据
@@ -172,13 +182,20 @@ export default function Playground() {
       body: () => {
         return {
           model: modelRef.current,
-          temperature: temperatureRef.current,
+          ...(temperatureRef.current !== undefined ? { temperature: temperatureRef.current } : {}),
           max_tokens: maxTokensRef.current,
           system: systemPromptRef.current,
         };
       },
       fetch: async (url, init) => {
-        const res = await fetch(url, init);
+        const token = await ensureFreshAccessToken();
+        const headers = new Headers(init?.headers);
+        if (token) {
+          headers.set('Authorization', `Bearer ${token}`);
+        } else {
+          headers.delete('Authorization');
+        }
+        const res = await fetch(url, { ...init, headers });
         if (!res.ok) {
           let message = res.statusText || 'Request failed';
           let code: number | undefined = res.status;
@@ -293,11 +310,11 @@ export default function Playground() {
     }
   }, [messages, regenerate, setMessages]);
 
-  // 渠道选项列表
+  // 渠道选项列表（仅展示启用中的渠道，已关闭的渠道不可用）
   const channelOptions = useMemo(() => {
     if (!channelsData?.edges) return [];
     return channelsData.edges
-      .filter((edge) => edge.node.allModelEntries.length > 0)
+      .filter((edge) => edge.node.status === 'enabled' && edge.node.allModelEntries.length > 0)
       .map((edge) => ({
         value: edge.node.id,
         label: edge.node.name,
@@ -315,12 +332,41 @@ export default function Playground() {
     });
   }, [modelsData]);
 
-  // 根据选中渠道过滤出模型列表
+  useEffect(() => {
+    if (!user || !channelsData || (modelSource === 'model_gateway' && canUseModelGateway && !modelsData)) return;
+    const channels = channelOptions.map((option) => ({
+      value: option.value,
+      models:
+        channelsData.edges.find((edge) => edge.node.id === option.value)?.node.allModelEntries.map((entry) => entry.requestModel) ?? [],
+    }));
+    const gatewayModels = modelPageModelOptions.map((option) => option.value);
+    setSelectionState((current) => {
+      if (current.projectId !== selectedProjectId) return current;
+      const resolved = resolveSelection(current, channels, gatewayModels, canUseModelGateway);
+      if (
+        current.ready &&
+        current.modelSource === resolved.modelSource &&
+        current.selectedChannel === resolved.selectedChannel &&
+        current.model === resolved.model
+      ) {
+        return current;
+      }
+      return { ...current, ...resolved, ready: true };
+    });
+  }, [canUseModelGateway, channelOptions, channelsData, modelPageModelOptions, modelSource, modelsData, selectedProjectId, user]);
+
+  useEffect(() => {
+    if (selection.ready && selection.projectId === selectedProjectId) {
+      writeSelection(selectedProjectId, { modelSource, selectedChannel, model });
+    }
+  }, [model, modelSource, selectedChannel, selectedProjectId, selection.projectId, selection.ready]);
+
+  // 根据选中渠道过滤出模型列表（渠道已关闭时不展示其模型）
   const modelOptions = useMemo(() => {
     if (isModelGatewaySource) return modelPageModelOptions;
     if (!channelsData?.edges || !selectedChannel) return [];
     const channelEdge = channelsData.edges.find((edge) => edge.node.id === selectedChannel);
-    if (!channelEdge) return [];
+    if (!channelEdge || channelEdge.node.status !== 'enabled') return [];
     return channelEdge.node.allModelEntries.map((entry) => ({
       value: entry.requestModel,
       label: entry.requestModel,
@@ -332,10 +378,9 @@ export default function Playground() {
   // 处理渠道选择，自动选第一个模型
   const handleChannelChange = useCallback(
     (channelId: string) => {
-      setSelectedChannel(channelId);
-      const channelEdge = channelsData?.edges?.find((edge) => edge.node.id === channelId);
+      const channelEdge = channelsData?.edges?.find((edge) => edge.node.id === channelId && edge.node.status === 'enabled');
       const firstModel = channelEdge?.node.allModelEntries[0]?.requestModel ?? '';
-      setModel(firstModel);
+      setSelectionState((current) => ({ ...current, selectedChannel: channelId, model: firstModel }));
     },
     [channelsData]
   );
@@ -346,35 +391,24 @@ export default function Playground() {
       if (nextSource === 'model_gateway' && !canUseModelGateway) {
         return;
       }
-      setModelSource(nextSource);
       if (nextSource === 'model_gateway') {
-        setModel(modelPageModelOptions[0]?.value ?? '');
+        setSelectionState((current) => ({
+          ...current,
+          modelSource: nextSource,
+          model: modelPageModelOptions[0]?.value ?? '',
+          ready: current.ready && !!modelsData,
+        }));
         return;
       }
-      const channelEdge = channelsData?.edges?.find((edge) => edge.node.id === selectedChannel);
-      setModel(channelEdge?.node.allModelEntries[0]?.requestModel ?? '');
+      const channelEdge = channelsData?.edges?.find((edge) => edge.node.id === selectedChannel && edge.node.status === 'enabled');
+      setSelectionState((current) => ({
+        ...current,
+        modelSource: nextSource,
+        model: channelEdge?.node.allModelEntries[0]?.requestModel ?? '',
+      }));
     },
-    [canUseModelGateway, channelsData, modelPageModelOptions, selectedChannel]
+    [canUseModelGateway, channelsData, modelPageModelOptions, modelsData, selectedChannel]
   );
-
-  useEffect(() => {
-    if (!canUseModelGateway && modelSource === 'model_gateway') {
-      setModelSource('channel');
-    }
-  }, [canUseModelGateway, modelSource]);
-
-  // 初始化：默认选第一个渠道和第一个模型
-  useEffect(() => {
-    if (!selectedChannel && !channelsLoading && channelOptions.length > 0) {
-      handleChannelChange(channelOptions[0].value);
-    }
-  }, [channelOptions, channelsLoading, handleChannelChange, selectedChannel]);
-
-  useEffect(() => {
-    if (isModelGatewaySource && !model && modelPageModelOptions.length > 0) {
-      setModel(modelPageModelOptions[0].value);
-    }
-  }, [isModelGatewaySource, model, modelPageModelOptions]);
 
   return (
     <TooltipProvider>
@@ -393,10 +427,10 @@ export default function Playground() {
           enabled={true}
         />
       )} */}
-      <div className='bg-background flex h-screen w-full flex-col md:flex-row'>
+      <div className='bg-background flex h-full min-h-0 w-full flex-col overflow-y-auto lg:flex-row lg:overflow-hidden'>
         {/* Settings Sidebar */}
 
-        <div className='bg-card shadow-soft border-border m-4 flex max-h-[60vh] w-auto flex-col rounded-2xl border border-r md:max-h-none md:w-[340px] md:min-w-[280px] md:max-w-[400px]'>
+        <div className='bg-card shadow-soft border-border m-4 flex max-h-[60vh] min-h-0 w-auto shrink-0 flex-col rounded-2xl border border-r lg:max-h-none lg:w-[340px] lg:max-w-[400px] lg:min-w-[280px] lg:shrink'>
           <div className='border-b p-4'>
             <h1 className='text-xl font-bold tracking-tight'>{t('playground.title')}</h1>
             <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>{t('playground.description')}</p>
@@ -458,9 +492,16 @@ export default function Playground() {
               </div>
 
               <div className='space-y-3'>
-                <Label htmlFor='temperature' className='text-xs font-semibold'>
-                  {t('playground.settings.temperature')}: {temperature}
-                </Label>
+                <div className='flex items-center justify-between gap-2'>
+                  <Label htmlFor='temperature' className='text-xs font-semibold'>
+                    {t('playground.settings.temperature')}: {temperature}
+                  </Label>
+                  <Switch
+                    aria-label={t('playground.settings.sendTemperature')}
+                    checked={sendTemperature}
+                    onCheckedChange={setSendTemperature}
+                  />
+                </div>
                 <div className='px-1'>
                   <Input
                     id='temperature'
@@ -469,6 +510,7 @@ export default function Playground() {
                     max='2'
                     step='0.1'
                     value={temperature}
+                    disabled={!sendTemperature}
                     onChange={(e) => setTemperature(parseFloat(e.target.value))}
                     className='bg-muted h-2 w-full cursor-pointer appearance-none rounded-lg'
                   />
@@ -478,6 +520,7 @@ export default function Playground() {
                     <span>2</span>
                   </div>
                 </div>
+                {!sendTemperature && <p className='text-muted-foreground text-xs'>{t('playground.settings.temperatureOmitted')}</p>}
               </div>
 
               <div className='space-y-3'>
@@ -536,9 +579,9 @@ export default function Playground() {
         </div>
 
         {/* Chat Area */}
-        <div className='flex flex-1 flex-col p-4'>
-          <div className='shadow-soft border-border bg-card flex h-full flex-col rounded-2xl border p-6'>
-            <Conversation className='max-h-[50vh] flex-1 md:max-h-none'>
+        <div className='flex min-h-[50vh] min-w-0 flex-1 flex-col p-4 lg:min-h-0'>
+          <div className='shadow-soft border-border bg-card flex h-full min-h-0 flex-col rounded-2xl border p-6'>
+            <Conversation className='max-h-[50vh] min-h-0 flex-1 lg:max-h-none'>
               <ConversationContent>
                 {messages.length === 0 ? (
                   <ConversationEmptyState
@@ -585,13 +628,7 @@ export default function Playground() {
                                     src={part.url}
                                   />
                                 ) : (
-                                  <a
-                                    key={index}
-                                    className='text-primary underline'
-                                    href={part.url}
-                                    rel='noreferrer'
-                                    target='_blank'
-                                  >
+                                  <a key={index} className='text-primary underline' href={part.url} rel='noreferrer' target='_blank'>
                                     {part.filename || 'attachment'}
                                   </a>
                                 );
@@ -640,7 +677,7 @@ export default function Playground() {
                 value={input}
                 placeholder={t('playground.chat.typeMessage')}
                 onChange={(e) => setInput(e.currentTarget.value)}
-                className='pl-12 pr-16'
+                className='pr-16 pl-12'
               />
               <PlaygroundImageButton />
               <PlaygroundSubmit input={input} status={status} onStop={stop} />

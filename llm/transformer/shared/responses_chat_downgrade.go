@@ -20,7 +20,7 @@ func DowngradeResponsesChatToolLifecycle(request *llm.Request) (*llm.Request, er
 	removedFunctionNames := make(map[string]struct{})
 	cloned.Tools = make([]llm.Tool, 0, len(request.Tools))
 	for _, tool := range request.Tools {
-		if requiresResponsesChatToolLifecycle(tool) {
+		if requiresResponsesChatToolLifecycle(tool, request.TransformerMetadata) {
 			if tool.ResponsesSourceType != "" {
 				name := tool.Function.Name
 				if name == "" {
@@ -54,7 +54,7 @@ func DowngradeResponsesChatToolLifecycle(request *llm.Request) (*llm.Request, er
 	}
 	cloned.Messages = filterOutToolLifecycleMessages(request.Messages, func(toolCall llm.ToolCall) bool {
 		_, removedSourceCall := removedSourceTools[toolCall.Function.Name]
-		return requiresResponsesChatToolLifecycleCall(toolCall) ||
+		return requiresResponsesChatToolLifecycleCall(toolCall, request.TransformerMetadata) ||
 			(toolCall.Type == llm.ToolTypeFunction && toolCall.Function.Namespace == "" &&
 				toolCall.Function.Name != "" && removedSourceCall)
 	})
@@ -70,19 +70,25 @@ func DowngradeResponsesChatToolLifecycle(request *llm.Request) (*llm.Request, er
 	return &cloned, nil
 }
 
-func requiresResponsesChatToolLifecycleCall(toolCall llm.ToolCall) bool {
+func requiresResponsesChatToolLifecycleCall(toolCall llm.ToolCall, metadata map[string]any) bool {
 	return toolCall.Type == llm.ToolTypeResponsesCustomTool ||
 		toolCall.ResponseCustomToolCall != nil ||
 		toolCall.Type == llm.ToolTypeResponsesToolSearch ||
 		toolCall.ResponseToolSearchCall != nil ||
-		toolCall.Function.Namespace != ""
+		namespaceNeedsRestoration(metadata, toolCall.Function.Namespace, toolCall.Function.Name)
 }
 
-func requiresResponsesChatToolLifecycle(tool llm.Tool) bool {
+func requiresResponsesChatToolLifecycle(tool llm.Tool, metadata map[string]any) bool {
 	return tool.Type == llm.ToolTypeResponsesCustomTool || tool.ResponseCustomTool != nil ||
 		tool.Type == llm.ToolTypeResponsesToolSearch || tool.ResponseToolSearch != nil ||
 		tool.Type == llm.ToolTypeResponsesOpaqueTool || tool.ResponseOpaqueTool != nil ||
-		tool.Function.Namespace != "" || tool.ResponsesSourceType != ""
+		tool.ResponsesSourceType != "" || namespaceNeedsRestoration(metadata, tool.Function.Namespace, tool.Function.Name)
+}
+
+// A plain Chat channel can forward flat names when the Responses inbound
+// recorded the namespace mapping that will restore its output.
+func namespaceNeedsRestoration(metadata map[string]any, namespace, name string) bool {
+	return namespace != "" && llm.NamespaceForFunctionName(metadata, name) != namespace
 }
 
 func filterResponsesToolChoiceForPlainFunctions(
@@ -94,9 +100,9 @@ func filterResponsesToolChoiceForPlainFunctions(
 		return tools, nil
 	}
 
-	if choice.AllowedToolsSet {
-		allowedFunctions := make(map[string]struct{}, len(choice.AllowedTools))
-		for _, option := range choice.AllowedTools {
+	if options, ok := choice.AllowedToolOptions(); ok {
+		allowedFunctions := make(map[string]struct{}, len(options))
+		for _, option := range options {
 			if option.Type != llm.ToolTypeFunction {
 				continue
 			}

@@ -21,6 +21,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	anthropic "github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 // mockInboundTransformer is a mock transformer for testing.
@@ -124,7 +125,7 @@ func newInboundPersistentStreamHelper(
 
 	requestService := createTestRequestService(t, client)
 
-	testRequest := &ent.Request{ID: 1}
+	testRequest := &ent.Request{ID: 1, RequestBody: []byte(`{"stream":true}`)}
 	testRequestExec := &ent.RequestExecution{ID: 1}
 
 	state := &PersistenceState{StreamCompleted: false}
@@ -174,8 +175,7 @@ func TestInboundPersistentStream_Close_WithCompleteResponse(t *testing.T) {
 	require.True(t, stream.Next(), "Expected Next() to return true")
 	event := stream.Current()
 	require.NotNil(t, event, "Expected current event to not be nil")
-
-	assert.True(t, state.StreamCompleted, "StreamCompleted should be true after consuming finish_reason")
+	stream.AcknowledgeDelivery()
 
 	err := stream.Close()
 	require.NoError(t, err, "Close() should not return an error")
@@ -222,8 +222,7 @@ func TestInboundPersistentStream_Close_WithTerminalEvent(t *testing.T) {
 	require.True(t, stream.Next(), "Expected Next() to return true for [DONE] event")
 	event := stream.Current()
 	require.NotNil(t, event, "Expected current event to not be nil")
-
-	assert.True(t, state.StreamCompleted, "StreamCompleted should be true after [DONE] event")
+	stream.AcknowledgeDelivery()
 
 	err := stream.Close()
 	require.NoError(t, err, "Close() should not return an error")
@@ -278,12 +277,176 @@ func TestInboundPersistentStream_Close_ErrorAfterTerminalKeepsRequestCompleted(t
 	_ = stream.Current()
 	require.False(t, stream.Next())
 	require.ErrorIs(t, stream.Err(), io.ErrUnexpectedEOF)
+	stream.AcknowledgeDelivery()
 	require.NoError(t, stream.Close())
 	require.True(t, state.StreamCompleted)
 
 	dbReq, err := client.Request.Get(ctx, req.ID)
 	require.NoError(t, err)
 	require.Equal(t, request.StatusCompleted, dbReq.Status)
+}
+
+func TestInboundPersistentStream_Close_CompleteAggregateAfterStreamErrorCompletesRequest(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	_, requestService, _, _ := setupTestServices(t, client)
+	req, err := client.Request.Create().
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("claude-opus-5-5").
+		SetFormat("anthropic/messages").
+		SetStatus(request.StatusProcessing).
+		SetRequestBody([]byte(`{"stream":true}`)).
+		SetStream(true).
+		Save(ctx)
+	require.NoError(t, err)
+
+	stream := &mockStream{
+		events: []*httpclient.StreamEvent{{
+			Type: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","delta":{"text":"complete"}}`),
+		}},
+		err: io.ErrUnexpectedEOF,
+	}
+	mockTransformer := &mockInboundTransformer{
+		aggregateResponseBody: []byte(`{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"complete"}],"stop_reason":"end_turn"}`),
+		aggregateMeta:         llm.ResponseMeta{ID: "msg_123", Completed: true},
+	}
+	state := &PersistenceState{}
+	persistentStream := NewInboundPersistentStream(
+		ctx,
+		stream,
+		req,
+		&ent.RequestExecution{ID: 1},
+		requestService,
+		mockTransformer,
+		nil,
+		state,
+	)
+
+	require.True(t, persistentStream.Next())
+	persistentStream.Current()
+	require.False(t, persistentStream.Next())
+	require.ErrorIs(t, persistentStream.Err(), io.ErrUnexpectedEOF)
+	persistentStream.AcknowledgeDelivery()
+	require.NoError(t, persistentStream.Close())
+	require.True(t, state.StreamCompleted)
+
+	savedRequest, err := client.Request.Get(ctx, req.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.StatusCompleted, savedRequest.Status)
+}
+
+func TestInboundPersistentStream_Close_UsageWithoutCompletionAfterStreamErrorFailsRequest(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	_, requestService, _, _ := setupTestServices(t, client)
+	req, err := client.Request.Create().
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("claude-opus-5-5").
+		SetStatus(request.StatusProcessing).
+		SetRequestBody([]byte(`{"stream":true}`)).
+		SetStream(true).
+		Save(ctx)
+	require.NoError(t, err)
+
+	stream := &mockStream{
+		events: []*httpclient.StreamEvent{{
+			Type: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","delta":{"text":"partial"}}`),
+		}},
+		err: io.ErrUnexpectedEOF,
+	}
+	transformer := &mockInboundTransformer{
+		aggregateResponseBody: []byte(`{"id":"msg_124","type":"message","role":"assistant","content":[{"type":"text","text":"partial"}]}`),
+		aggregateMeta: llm.ResponseMeta{
+			ID:    "msg_124",
+			Usage: &llm.Usage{CompletionTokens: 1},
+		},
+	}
+	state := &PersistenceState{}
+	persistentStream := NewInboundPersistentStream(
+		ctx,
+		stream,
+		req,
+		&ent.RequestExecution{ID: 1},
+		requestService,
+		transformer,
+		nil,
+		state,
+	)
+
+	require.True(t, persistentStream.Next())
+	persistentStream.Current()
+	require.False(t, persistentStream.Next())
+	require.ErrorIs(t, persistentStream.Err(), io.ErrUnexpectedEOF)
+	require.NoError(t, persistentStream.Close())
+	require.False(t, state.StreamCompleted)
+
+	savedRequest, err := client.Request.Get(ctx, req.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.StatusFailed, savedRequest.Status)
+}
+
+func TestInboundPersistentStream_Close_AnthropicStopReasonAfterStreamErrorCompletesRequest(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	_, requestService, _, _ := setupTestServices(t, client)
+	req, err := client.Request.Create().
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("claude-opus-5-5").
+		SetFormat("anthropic/messages").
+		SetStatus(request.StatusProcessing).
+		SetRequestBody([]byte(`{"stream":true}`)).
+		SetStream(true).
+		Save(ctx)
+	require.NoError(t, err)
+
+	stream := &mockStream{
+		events: []*httpclient.StreamEvent{
+			{Data: []byte(`{"type":"message_start","message":{"id":"msg_stop","type":"message","role":"assistant","content":[],"model":"claude-opus-5-5"}}`)},
+			{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`)},
+			{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+		},
+		err: io.ErrUnexpectedEOF,
+	}
+	state := &PersistenceState{}
+	persistentStream := NewInboundPersistentStream(
+		ctx,
+		stream,
+		req,
+		&ent.RequestExecution{ID: 1},
+		requestService,
+		anthropic.NewInboundTransformer(),
+		nil,
+		state,
+	)
+
+	for persistentStream.Next() {
+		_ = persistentStream.Current()
+	}
+	require.ErrorIs(t, persistentStream.Err(), io.ErrUnexpectedEOF)
+	persistentStream.AcknowledgeDelivery()
+	require.NoError(t, persistentStream.Close())
+
+	savedRequest, err := client.Request.Get(ctx, req.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.StatusCompleted, savedRequest.Status)
+	require.True(t, state.StreamCompleted)
 }
 
 func TestInboundPersistentStream_Close_ResponsesFailureTerminalPersistsOutcome(t *testing.T) {

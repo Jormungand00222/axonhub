@@ -415,13 +415,8 @@ func TestResponsesToChatTools_NamespaceFlattenedNameCollisionFailsStrictly(t *te
 			{"type":"namespace","name":"mcp__server","tools":[{"type":"function","name":"list","parameters":{"type":"object"}}]}
 		]
 	}`)})
-	require.NoError(t, err)
-
-	chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
-	require.NoError(t, err)
-	chatRequest, err := chatOutbound.TransformRequest(ctx, llmRequest)
-	require.ErrorContains(t, err, `tool_name_conflict: Chat name "mcp__server__list" is required by namespace mcp.server__list and namespace mcp__server.list`)
-	require.Nil(t, chatRequest)
+	require.ErrorContains(t, err, `namespace tool flat name "mcp__server__list" conflicts`)
+	require.Nil(t, llmRequest)
 }
 
 func TestResponsesToChatTools_NormalizesMissingObjectParameterTypes(t *testing.T) {

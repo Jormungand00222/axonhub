@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -143,6 +144,56 @@ func normalizeResponsesStreamCompatibilityFields(response *llm.Response) {
 			delta.Content.Content = nil
 		}
 	}
+}
+
+func TestResponsesStream_PreservesResponseMetadata(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	metadata := []byte(`{"type":"response.metadata","headers":{"x-codex-turn-state":"ts-1"}}`)
+	created := []byte(`{"type":"response.created","response":{"id":"resp-1","object":"response","created_at":1700000000,"model":"gpt-5","status":"in_progress","output":[]}}`)
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","object":"response","created_at":1700000000,"model":"gpt-5","status":"completed","output":[]}}`)
+
+	llmStream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream([]*httpclient.StreamEvent{
+		{
+			Type:    string(StreamEventTypeResponseMetadata),
+			Data:    metadata,
+			Headers: http.Header{"X-Codex-Turn-State": []string{"ts-1"}},
+		},
+		{Type: string(StreamEventTypeResponseCreated), Data: created},
+		{Type: string(StreamEventTypeResponseCompleted), Data: completed},
+	}))
+	require.NoError(t, err)
+
+	var responses []*llm.Response
+	for llmStream.Next() {
+		responses = append(responses, llmStream.Current())
+	}
+	require.NoError(t, llmStream.Err())
+
+	var metadataResponse *llm.Response
+	for _, response := range responses {
+		if _, ok := rawResponseMetadataEvent(response.TransformerMetadata); ok {
+			metadataResponse = response
+			break
+		}
+	}
+	require.NotNil(t, metadataResponse)
+
+	downstream, err := NewInboundTransformer().TransformStream(t.Context(), streams.SliceStream(responses))
+	require.NoError(t, err)
+	var metadataEvent *httpclient.StreamEvent
+	for downstream.Next() {
+		event := downstream.Current()
+		if event.Type == string(StreamEventTypeResponseMetadata) {
+			metadataEvent = event
+			break
+		}
+	}
+	require.NoError(t, downstream.Err())
+	require.NotNil(t, metadataEvent)
+	require.JSONEq(t, string(metadata), string(metadataEvent.Data))
+	require.Equal(t, "ts-1", metadataEvent.Headers.Get("X-Codex-Turn-State"))
 }
 
 func TestOutboundTransformer_TransformStream_IncompleteResponseDoesNotEmitDone(t *testing.T) {
@@ -604,6 +655,76 @@ func TestOutboundTransformer_TransformStream_EmitsArgumentsProvidedOnlyInDone(t 
 	require.JSONEq(t, `{"task":"delegate this task"}`, arguments)
 }
 
+// Chat Completions clients such as the OpenAI SDK join every string field of a tool call delta, so the
+// done event must not send the id and name again (#2648).
+func TestOutboundTransformer_TransformStream_DoneDoesNotRepeatToolCallIdentity(t *testing.T) {
+	tests := []struct {
+		name           string
+		addedName      string
+		addedNamespace string
+		deltas         []string
+		doneName       string
+		doneNamespace  string
+		wantName       string
+		wantNamespace  string
+	}{
+		{name: "arguments only in done", addedName: "get_weather", doneName: "get_weather", wantName: "get_weather"},
+		{name: "remaining arguments in done", addedName: "get_weather", deltas: []string{`{\"city\":`}, doneName: "get_weather", wantName: "get_weather"},
+		{name: "namespace only in done", addedName: "get_weather", doneName: "get_weather", doneNamespace: "weather_tools", wantName: "get_weather", wantNamespace: "weather_tools"},
+		{name: "name only in done keeps namespace", addedNamespace: "collaboration", doneName: "spawn_agent", doneNamespace: "collaboration", wantName: "collaboration__spawn_agent", wantNamespace: "collaboration"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+			require.NoError(t, err)
+
+			events := []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"response.created","response":{"id":"resp_identity","object":"response","created_at":1700000000,"model":"gpt-5","status":"in_progress","output":[]}}`)},
+				{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_identity","type":"function_call","call_id":"call_identity","name":"` + tt.addedName + `","namespace":"` + tt.addedNamespace + `","arguments":""}}`)},
+			}
+			for _, delta := range tt.deltas {
+				events = append(events, &httpclient.StreamEvent{Data: []byte(`{"type":"response.function_call_arguments.delta","item_id":"fc_identity","output_index":0,"delta":"` + delta + `"}`)})
+			}
+			events = append(events,
+				&httpclient.StreamEvent{Data: []byte(`{"type":"response.function_call_arguments.done","item_id":"fc_identity","output_index":0,"name":"` + tt.doneName + `","namespace":"` + tt.doneNamespace + `","arguments":"{\"city\":\"Paris\"}"}`)},
+				&httpclient.StreamEvent{Data: []byte(`{"type":"response.completed","response":{"id":"resp_identity","object":"response","created_at":1700000000,"model":"gpt-5","status":"completed","output":[]}}`)},
+			)
+
+			stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream(events))
+			require.NoError(t, err)
+
+			responses, err := streams.All(stream)
+			require.NoError(t, err)
+
+			// Join string fields the way Chat Completions clients do. Namespace has no Chat
+			// Completions field; the Responses inbound stream replaces it, so keep the last one.
+			var id, toolType, name, namespace, arguments string
+			for _, response := range responses {
+				if response == llm.DoneResponse || len(response.Choices) == 0 || response.Choices[0].Delta == nil {
+					continue
+				}
+
+				for _, toolCall := range response.Choices[0].Delta.ToolCalls {
+					id += toolCall.ID
+					toolType += toolCall.Type
+					name += toolCall.Function.Name
+					if toolCall.Function.Namespace != "" {
+						namespace = toolCall.Function.Namespace
+					}
+					arguments += toolCall.Function.Arguments
+				}
+			}
+
+			require.Equal(t, "call_identity", id)
+			require.Equal(t, "function", toolType)
+			require.Equal(t, tt.wantName, name)
+			require.Equal(t, tt.wantNamespace, namespace)
+			require.JSONEq(t, `{"city":"Paris"}`, arguments)
+		})
+	}
+}
+
 func TestOutboundTransformer_TransformStream_AcceptsEquivalentFinalArguments(t *testing.T) {
 	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
 	require.NoError(t, err)
@@ -758,6 +879,139 @@ func TestResponsesStream_RoundTrip_DefersFunctionCallUntilLateIdentityArrives(t 
 	require.Equal(t, "spawn_agent", addedItems[0].Name)
 	require.Equal(t, "collaboration", addedItems[0].Namespace)
 	require.JSONEq(t, arguments, receivedArguments)
+}
+
+func TestResponsesStream_RoundTrip_PreservesCustomToolInputProvidedOnlyInFinalEvents(t *testing.T) {
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	input := "*** Begin Patch\n*** Add File: /tmp/probe.txt\n+hello\n*** End Patch\n"
+	upstreamEvents := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"response.created","response":{"id":"resp_custom_done_input","object":"response","created_at":1700000000,"model":"gpt-5","status":"in_progress","output":[]}}`)},
+		{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_custom_done_input","type":"custom_tool_call","call_id":"call_custom_done_input","name":"apply_patch","input":""}}`)},
+		{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_custom_done_input","output_index":0,"input":"*** Begin Patch\n*** Add File: /tmp/probe.txt\n+hello\n*** End Patch\n"}`)},
+		{Data: []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"ct_custom_done_input","type":"custom_tool_call","status":"completed","call_id":"call_custom_done_input","name":"apply_patch","input":"*** Begin Patch\n*** Add File: /tmp/probe.txt\n+hello\n*** End Patch\n"}}`)},
+		{Data: []byte(`{"type":"response.completed","response":{"id":"resp_custom_done_input","object":"response","created_at":1700000000,"model":"gpt-5","status":"completed","output":[]}}`)},
+	}
+
+	unifiedStream, err := outbound.TransformStream(t.Context(), nil, streams.SliceStream(upstreamEvents))
+	require.NoError(t, err)
+
+	clientStream, err := NewInboundTransformer().TransformStream(t.Context(), unifiedStream)
+	require.NoError(t, err)
+
+	clientEvents, err := streams.All(clientStream)
+	require.NoError(t, err)
+
+	var completedInput string
+	for _, clientEvent := range clientEvents {
+		if string(clientEvent.Data) == "[DONE]" {
+			continue
+		}
+
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(clientEvent.Data, &event))
+		if event.Type == StreamEventTypeOutputItemDone && event.Item != nil && event.Item.Type == "custom_tool_call" {
+			completedInput = lo.FromPtr(event.Item.Input)
+		}
+	}
+
+	require.Equal(t, input, completedInput)
+}
+
+func TestOutboundTransformer_TransformStream_ReconcilesCustomToolFinalInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		events   []*httpclient.StreamEvent
+		expected map[string]string
+	}{
+		{
+			name: "custom tool input done is the only final input source",
+			events: []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_input_done","type":"custom_tool_call","call_id":"call_input_done","name":"apply_patch","input":""}}`)},
+				{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_input_done","output_index":0,"input":"complete input"}`)},
+			},
+			expected: map[string]string{"call_input_done": "complete input"},
+		},
+		{
+			name: "output item done is the only final input source",
+			events: []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_item_done","type":"custom_tool_call","call_id":"call_item_done","name":"apply_patch","input":""}}`)},
+				{Data: []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"ct_item_done","type":"custom_tool_call","status":"completed","call_id":"call_item_done","name":"apply_patch","input":"complete input"}}`)},
+			},
+			expected: map[string]string{"call_item_done": "complete input"},
+		},
+		{
+			name: "final input adds only the suffix missing from deltas",
+			events: []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_partial","type":"custom_tool_call","call_id":"call_partial","name":"apply_patch","input":""}}`)},
+				{Data: []byte(`{"type":"response.custom_tool_call_input.delta","item_id":"ct_partial","output_index":0,"delta":"partial"}`)},
+				{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_partial","output_index":0,"input":"partial input"}`)},
+				{Data: []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"ct_partial","type":"custom_tool_call","status":"completed","call_id":"call_partial","name":"apply_patch","input":"partial input"}}`)},
+			},
+			expected: map[string]string{"call_partial": "partial input"},
+		},
+		{
+			name: "multiple calls keep their final inputs isolated",
+			events: []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_first","type":"custom_tool_call","call_id":"call_first","name":"apply_patch","input":""}}`)},
+				{Data: []byte(`{"type":"response.output_item.added","output_index":1,"item":{"id":"ct_second","type":"custom_tool_call","call_id":"call_second","name":"write_file","input":""}}`)},
+				{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_second","output_index":1,"input":"second input"}`)},
+				{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_first","output_index":0,"input":"first input"}`)},
+			},
+			expected: map[string]string{
+				"call_first":  "first input",
+				"call_second": "second input",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+			require.NoError(t, err)
+
+			tt.events = append(tt.events,
+				&httpclient.StreamEvent{Data: []byte(`{"type":"response.completed","response":{"id":"resp_custom_final_input","object":"response","created_at":1700000000,"model":"gpt-5","status":"completed","output":[]}}`)},
+			)
+			stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream(tt.events))
+			require.NoError(t, err)
+
+			responses, err := streams.All(stream)
+			require.NoError(t, err)
+
+			actual := make(map[string]string)
+			for _, response := range responses {
+				if response == llm.DoneResponse || len(response.Choices) == 0 || response.Choices[0].Delta == nil {
+					continue
+				}
+				for _, toolCall := range response.Choices[0].Delta.ToolCalls {
+					if toolCall.ResponseCustomToolCall != nil && toolCall.ResponseCustomToolCall.Input != "" {
+						actual[toolCall.ResponseCustomToolCall.CallID] += toolCall.ResponseCustomToolCall.Input
+					}
+				}
+			}
+
+			require.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformStream_RejectsConflictingCustomToolFinalInput(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	events := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ct_conflict","type":"custom_tool_call","call_id":"call_conflict","name":"apply_patch","input":""}}`)},
+		{Data: []byte(`{"type":"response.custom_tool_call_input.delta","item_id":"ct_conflict","output_index":0,"delta":"forwarded input"}`)},
+		{Data: []byte(`{"type":"response.custom_tool_call_input.done","item_id":"ct_conflict","output_index":0,"input":"different input"}`)},
+	}
+
+	stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream(events))
+	require.NoError(t, err)
+
+	_, err = streams.All(stream)
+	require.ErrorContains(t, err, `custom tool call input mismatch for call_id "call_conflict"`)
 }
 
 func TestOutboundTransformer_TransformStream_PreservesFinalItemAnnotations(t *testing.T) {
@@ -1381,4 +1635,53 @@ func TestOutboundTransformer_TransformStream_PreservesOfficialWebSocketError(t *
 			require.Equal(t, "input", responseErr.Detail.Param)
 		})
 	}
+}
+
+func TestResponsesOutboundStreamResponseFailedPreservesCode(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream([]*httpclient.StreamEvent{{
+		Type: "response.failed",
+		Data: []byte(`{"type":"response.failed","response":{"id":"resp_failed","object":"response","created_at":1700000000,"model":"gpt-5","status":"failed","output":[],"error":{"type":"server_error","code":"server_is_overloaded","message":"server overloaded"}}}`),
+	}}))
+	require.NoError(t, err)
+
+	_, err = streams.All(stream)
+	var responseErr *llm.ResponseError
+	require.ErrorAs(t, err, &responseErr)
+	require.Equal(t, "server_is_overloaded", responseErr.Detail.Code)
+	require.ErrorIs(t, err, llm.ErrEmptyResponse)
+	require.EqualError(t, err, "error: server overloaded, code: server_is_overloaded, type: server_error")
+	require.Equal(t, "error: server overloaded, code: server_is_overloaded, type: server_error", responseErr.Error())
+}
+
+func TestResponsesOutboundStreamResponseFailedUnrelatedCode(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream([]*httpclient.StreamEvent{{
+		Type: "response.failed",
+		Data: []byte(`{"type":"response.failed","response":{"id":"resp_failed","object":"response","created_at":1700000000,"model":"gpt-5","status":"failed","output":[],"error":{"type":"server_error","code":"context_length_exceeded","message":"context too long"}}}`),
+	}}))
+	require.NoError(t, err)
+
+	_, err = streams.All(stream)
+	var responseErr *llm.ResponseError
+	require.ErrorAs(t, err, &responseErr)
+	require.Equal(t, "context_length_exceeded", responseErr.Detail.Code)
+}
+
+func TestResponsesOutboundStreamResponseFailedMalformed(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream([]*httpclient.StreamEvent{
+		{Type: "response.failed", Data: []byte(`{"type":"response.failed","response":{}}`)},
+	}))
+	require.NoError(t, err)
+
+	events, err := streams.All(stream)
+	require.NoError(t, err)
+	require.NotEmpty(t, events)
 }

@@ -296,6 +296,27 @@ func TestNativeBudgetRoundTrip(t *testing.T) {
 	require.Nil(t, anthropicReq.OutputConfig)
 }
 
+// TestEnabledWithoutBudget covers Z.AI/GLM-style clients that send thinking.type=enabled
+// without budget_tokens: the Anthropic outbound must fill in the channel's medium budget.
+func TestEnabledWithoutBudget(t *testing.T) {
+	chatReq, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body:    []byte(`{"model":"glm-4.6","max_tokens":32000,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"}}`),
+	})
+	require.NoError(t, err)
+
+	anthropicReq := convertToAnthropicRequestWithConfig(chatReq, nil)
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "enabled", anthropicReq.Thinking.Type)
+	require.Equal(t, int64(15000), anthropicReq.Thinking.BudgetTokens)
+
+	anthropicReq = convertToAnthropicRequestWithConfig(chatReq, &Config{
+		ReasoningEffortToBudget: map[string]int64{"medium": 4096},
+	})
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, int64(4096), anthropicReq.Thinking.BudgetTokens)
+}
+
 func TestNativeBudgetRoundTrip_DeepSeekUsesOutputConfig(t *testing.T) {
 	chatReq := &llm.Request{
 		Model:           "deepseek-chat",
@@ -704,6 +725,66 @@ func TestThinking_AdaptiveOutbound(t *testing.T) {
 				thinkingJSON, err := json.Marshal(anthropicReq.Thinking)
 				require.NoError(t, err)
 				require.JSONEq(t, `{"type":"disabled"}`, string(thinkingJSON))
+			},
+		},
+		{
+			name: "metadata thinking_type=between_tools -> Thinking{Type: between_tools}",
+			chatReq: &llm.Request{
+				Model:     "claude-sonnet-5-5",
+				MaxTokens: lo.ToPtr(int64(4096)),
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello"),
+						},
+					},
+				},
+				ReasoningEffort: "none",
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyThinkingType: "between_tools",
+				},
+			},
+			validate: func(t *testing.T, anthropicReq *MessageRequest) {
+				t.Helper()
+				require.NotNil(t, anthropicReq.Thinking)
+				require.Equal(t, "between_tools", anthropicReq.Thinking.Type)
+
+				thinkingJSON, err := json.Marshal(anthropicReq.Thinking)
+				require.NoError(t, err)
+				require.JSONEq(t, `{"type":"between_tools"}`, string(thinkingJSON))
+			},
+		},
+		{
+			name: "metadata thinking_type=between_tools -> Thinking{Type: between_tools} and keep output_config.effort",
+			chatReq: &llm.Request{
+				Model:     "claude-sonnet-5-5",
+				MaxTokens: lo.ToPtr(int64(4096)),
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello"),
+						},
+					},
+				},
+				ReasoningEffort: "none",
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyThinkingType:       "between_tools",
+					TransformerMetadataKeyOutputConfigEffort: "high",
+				},
+			},
+			validate: func(t *testing.T, anthropicReq *MessageRequest) {
+				t.Helper()
+				require.NotNil(t, anthropicReq.Thinking)
+				require.Equal(t, "between_tools", anthropicReq.Thinking.Type)
+
+				thinkingJSON, err := json.Marshal(anthropicReq.Thinking)
+				require.NoError(t, err)
+				require.JSONEq(t, `{"type":"between_tools"}`, string(thinkingJSON))
+
+				require.NotNil(t, anthropicReq.OutputConfig)
+				require.Equal(t, "high", anthropicReq.OutputConfig.Effort)
 			},
 		},
 		{

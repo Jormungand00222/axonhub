@@ -31,13 +31,23 @@ type PersistenceState struct {
 	Proxy *httpclient.ProxyConfig
 
 	// OriginalModel is the model after API key profile mapping, used for channel selection
-	OriginalModel string
-	RawRequest    *httpclient.Request
-	LlmRequest    *llm.Request
+	OriginalModel         string
+	RawRequest            *httpclient.Request
+	LlmRequest            *llm.Request
+	ResponsesContinuation *responsesContinuation
 
 	// OriginalRequestStream stores the client's original stream intent before any
 	// candidate-specific forcing to provider-side streaming happens.
 	OriginalRequestStream *bool
+
+	// PromptProtectionMaskRules records the mask rules that changed this request.
+	// Request-body pass-through uses it to patch the original JSON without dropping
+	// provider-specific fields that are not represented by the unified request.
+	PromptProtectionMaskRules []*ent.PromptProtectionRule
+
+	// PromptProtectionBodyCheck verifies raw replay against the protected prompt
+	// snapshot using the actual inbound mapping, including legacy protectors.
+	PromptProtectionBodyCheck *promptProtectionBodyCheck
 
 	// Persistence state
 	Request     *ent.Request
@@ -64,11 +74,21 @@ type PersistenceState struct {
 	// HTTP/stream error for the client.
 	StreamCompleted bool
 
+	// DeliveryAcknowledged is set only after the downstream semantic boundary is
+	// written successfully. AccountingFinal is independent from delivery and
+	// usage values; downstream finalization owns when to publish either state.
+	DeliveryAcknowledged bool
+	AccountingFinal      bool
+	AccountingSourceEnd  llm.SourceEndReason
+
 	// OutboundStreamTerminal preserves the provider outcome across protocol
 	// conversion, which may replace an abnormal terminal event with a generic stop.
 	// Request/execution status and channel health intentionally interpret this
 	// outcome differently, as described by StreamCompleted and Perf above.
 	OutboundStreamTerminal streamTerminalState
+	// CleanEOFCompletionEvidence is set only by a protocol transformer after it
+	// has exhausted a clean source and emitted validated terminal evidence.
+	CleanEOFCompletionEvidence bool
 
 	// RawProviderResponse stores the raw provider response for non-stream response pass-through.
 	RawProviderResponse *httpclient.Response
@@ -76,8 +96,19 @@ type PersistenceState struct {
 	// RawProviderRequest stores the actual outbound provider request for pass-through checks.
 	RawProviderRequest *httpclient.Request
 
-	// RawStreamCh receives raw provider stream events for stream response pass-through.
+	// RawStreamCh receives raw provider stream events for stream response pass-through
+	// once the pass-through consumer is attached; earlier events are held on
+	// RawStreamBacklog.
 	RawStreamCh chan *httpclient.StreamEvent
+
+	// RawStreamQueue owns aggregate count and byte accounting for raw events
+	// retained after the pass-through consumer attaches.
+	RawStreamQueue *rawStreamQueue
+
+	// RawStreamBacklog holds the current attempt's raw provider stream events until
+	// applyPassThroughStream attaches the pass-through consumer, so the pipeline can
+	// pre-read the attempt without the fan-out goroutine blocking on RawStreamCh.
+	RawStreamBacklog *rawStreamBacklog
 
 	// RawStreamErrRef points to the current attempt's local error variable used by the
 	// captureRawProviderStream fan-out goroutine. Using a per-attempt pointer (instead of
@@ -89,6 +120,7 @@ type PersistenceState struct {
 	// captureRawProviderStream. Must be called in PrepareForRetry and NextChannel so the
 	// abandoned goroutine exits promptly and releases its upstream HTTP connection.
 	RawStreamCancel context.CancelFunc
+	RawStreamDetach context.CancelFunc
 
 	// PassThroughApplied records whether the inbound request body was substituted during pass-through.
 	PassThroughApplied bool

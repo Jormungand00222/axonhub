@@ -1,6 +1,9 @@
 package llm
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"slices"
+)
 
 // ProviderExtensions carries provider/API-format private data that should not
 // be serialized through the common llm request/response JSON model.
@@ -13,13 +16,15 @@ type OpenAIResponsesProviderExtensions struct {
 }
 
 type OpenAIResponsesRequestExtensions struct {
-	ReasoningContext string                       `json:"-"`
-	RawFields        map[string]json.RawMessage   `json:"-"`
-	RawTools         []OpenAIResponsesRawFragment `json:"-"`
-	RawToolChoice    json.RawMessage              `json:"-"`
-	RawInputItems    []OpenAIResponsesRawFragment `json:"-"`
-	RawInputMessages []string                     `json:"-"`
-	RawInputTools    []string                     `json:"-"`
+	ReasoningContext        string                       `json:"-"`
+	RawFields               map[string]json.RawMessage   `json:"-"`
+	RawTools                []OpenAIResponsesRawFragment `json:"-"`
+	ToolSignatures          []string                     `json:"-"`
+	RawToolChoice           json.RawMessage              `json:"-"`
+	RawInputItems           []OpenAIResponsesRawFragment `json:"-"`
+	OmittedInputItemIndices []int                        `json:"-"`
+	RawInputMessages        []string                     `json:"-"`
+	RawInputTools           []string                     `json:"-"`
 }
 
 type OpenAIResponsesRawFragment struct {
@@ -58,13 +63,15 @@ func CloneProviderExtensions(src *ProviderExtensions) *ProviderExtensions {
 		cloned.OpenAIResponses = &OpenAIResponsesProviderExtensions{}
 		if src.OpenAIResponses.Request != nil {
 			cloned.OpenAIResponses.Request = &OpenAIResponsesRequestExtensions{
-				ReasoningContext: src.OpenAIResponses.Request.ReasoningContext,
-				RawFields:        cloneRawMessageMap(src.OpenAIResponses.Request.RawFields),
-				RawTools:         cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawTools),
-				RawToolChoice:    cloneRawMessage(src.OpenAIResponses.Request.RawToolChoice),
-				RawInputItems:    cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawInputItems),
-				RawInputMessages: append([]string(nil), src.OpenAIResponses.Request.RawInputMessages...),
-				RawInputTools:    append([]string(nil), src.OpenAIResponses.Request.RawInputTools...),
+				ReasoningContext:        src.OpenAIResponses.Request.ReasoningContext,
+				ToolSignatures:          slices.Clone(src.OpenAIResponses.Request.ToolSignatures),
+				OmittedInputItemIndices: slices.Clone(src.OpenAIResponses.Request.OmittedInputItemIndices),
+				RawFields:               cloneRawMessageMap(src.OpenAIResponses.Request.RawFields),
+				RawTools:                cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawTools),
+				RawToolChoice:           cloneRawMessage(src.OpenAIResponses.Request.RawToolChoice),
+				RawInputItems:           cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawInputItems),
+				RawInputMessages:        append([]string(nil), src.OpenAIResponses.Request.RawInputMessages...),
+				RawInputTools:           append([]string(nil), src.OpenAIResponses.Request.RawInputTools...),
 			}
 		}
 	}
@@ -105,4 +112,20 @@ func cloneRawMessage(src json.RawMessage) json.RawMessage {
 	}
 
 	return append(json.RawMessage(nil), src...)
+}
+
+// NamespaceMappingMetadataKey records the original Responses namespace by flat function name.
+const NamespaceMappingMetadataKey = "namespace_mapping"
+
+// NamespaceForFunctionName accepts both the original map and its JSON-decoded form.
+func NamespaceForFunctionName(metadata map[string]any, name string) string {
+	switch mapping := metadata[NamespaceMappingMetadataKey].(type) {
+	case map[string]string:
+		return mapping[name]
+	case map[string]any:
+		namespace, _ := mapping[name].(string)
+		return namespace
+	default:
+		return ""
+	}
 }

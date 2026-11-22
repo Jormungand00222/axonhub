@@ -72,7 +72,10 @@ func TestPipeline_Streaming_OpenAI_to_OpenAI(t *testing.T) {
 			require.Equal(t, "Bearer test-api-key", request.Headers.Get("Authorization"))
 
 			// Return mock stream
-			return streams.SliceStream(streamEvents), nil
+			return httpclient.WithResponseHeaders(streams.SliceStream(streamEvents), http.Header{
+				httpclient.ReasoningIncludedHeader: []string{"true"},
+				"Set-Cookie":                       []string{"secret=1"},
+			}), nil
 		},
 	}
 
@@ -128,6 +131,8 @@ func TestPipeline_Streaming_OpenAI_to_OpenAI(t *testing.T) {
 	require.NotNil(t, result)
 	require.True(t, result.Stream)
 	require.NotNil(t, result.EventStream)
+	require.Equal(t, "true", httpclient.GetResponseHeaders(result.EventStream).Get(httpclient.ReasoningIncludedHeader))
+	require.Empty(t, httpclient.GetResponseHeaders(result.EventStream).Get("Set-Cookie"))
 
 	// Collect all events from the stream
 	var collectedEvents []*httpclient.StreamEvent
@@ -461,7 +466,10 @@ func TestPipeline_NonStreaming_AutoAggregateUpgradedStream(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, true, reqBody["stream"])
 
-			return streams.SliceStream(streamEvents), nil
+			return httpclient.WithResponseHeaders(streams.SliceStream(streamEvents), http.Header{
+				httpclient.ReasoningIncludedHeader: []string{"true"},
+				"Set-Cookie":                       []string{"secret=1"},
+			}), nil
 		},
 	}
 
@@ -515,12 +523,99 @@ func TestPipeline_NonStreaming_AutoAggregateUpgradedStream(t *testing.T) {
 	require.NotNil(t, result.Response)
 	require.Equal(t, http.StatusOK, result.Response.StatusCode)
 	require.Equal(t, "application/json", result.Response.Headers.Get("Content-Type"))
+	require.Equal(t, "true", result.Response.Headers.Get(httpclient.ReasoningIncludedHeader))
+	require.Empty(t, result.Response.Headers.Get("Set-Cookie"))
 
 	var finalResponse map[string]any
 	err = json.Unmarshal(result.Response.Body, &finalResponse)
 	require.NoError(t, err)
 	require.Equal(t, "chat.completion", finalResponse["object"])
 	require.NotEmpty(t, finalResponse["choices"])
+}
+
+// TestPipeline_NonStreaming_AutoAggregateUpgradedStream_PreservesRefusal covers
+// the stream-required channel path end to end: a non-streaming chat completions
+// client whose channel forces streaming must still receive the model's refusal
+// in the aggregated response instead of an empty assistant message.
+func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_PreservesRefusal(t *testing.T) {
+	ctx := context.Background()
+
+	inbound := openai.NewInboundTransformer()
+	baseOutbound, err := openai.NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	outbound := &streamUpgradeOutboundWrapper{Outbound: baseOutbound}
+
+	streamEvents := []*httpclient.StreamEvent{
+		{Data: []byte(`{"id":"chatcmpl-ref","object":"chat.completion.chunk","created":1720000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`)},
+		{Data: []byte(`{"id":"chatcmpl-ref","object":"chat.completion.chunk","created":1720000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"refusal":"I'm sorry, but I "},"finish_reason":null}]}`)},
+		{Data: []byte(`{"id":"chatcmpl-ref","object":"chat.completion.chunk","created":1720000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"refusal":"can't help with that."},"finish_reason":"stop"}]}`)},
+		{Data: []byte(`{"id":"chatcmpl-ref","object":"chat.completion.chunk","created":1720000000,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}`)},
+		{Data: []byte("[DONE]")},
+	}
+
+	executor := &mockExecutor{
+		doStreamFunc: func(ctx context.Context, request *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
+			require.Equal(t, http.MethodPost, request.Method)
+			require.Contains(t, request.URL, "/chat/completions")
+
+			var reqBody map[string]any
+			err := json.Unmarshal(request.Body, &reqBody)
+			require.NoError(t, err)
+			require.Equal(t, true, reqBody["stream"])
+
+			return streams.SliceStream(streamEvents), nil
+		},
+	}
+
+	factory := pipeline.NewFactory(executor)
+	pipeline := factory.Pipeline(inbound, outbound)
+
+	requestBody := map[string]any{
+		"model": "gpt-4o",
+		"messages": []map[string]any{
+			{
+				"role":    "user",
+				"content": "Test message",
+			},
+		},
+	}
+
+	requestBodyBytes, err := json.Marshal(requestBody)
+	require.NoError(t, err)
+
+	httpRequest := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: requestBodyBytes,
+	}
+
+	result, err := pipeline.Process(ctx, httpRequest)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Stream)
+	require.NotNil(t, result.Response)
+	require.Equal(t, http.StatusOK, result.Response.StatusCode)
+
+	var finalResponse map[string]any
+	err = json.Unmarshal(result.Response.Body, &finalResponse)
+	require.NoError(t, err)
+	require.Equal(t, "chat.completion", finalResponse["object"])
+
+	choices, ok := finalResponse["choices"].([]any)
+	require.True(t, ok)
+	require.Len(t, choices, 1)
+
+	choice, ok := choices[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "stop", choice["finish_reason"])
+
+	message, ok := choice["message"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "I'm sorry, but I can't help with that.", message["refusal"])
 }
 
 func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_OpenAIEmptyStreamChunks(t *testing.T) {
@@ -668,7 +763,6 @@ func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_EmptyAggregatedBody(t
 	require.ErrorContains(t, err, "failed to auto-aggregate streaming response")
 	require.ErrorContains(t, err, "empty aggregated body")
 }
-
 
 func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_EmptyJSONObjectAggregatedBodyAllowed(t *testing.T) {
 	ctx := context.Background()

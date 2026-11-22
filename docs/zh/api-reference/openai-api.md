@@ -54,16 +54,69 @@ fmt.Println(responseText)
 
 ### OpenAI Responses API
 
-AxonHub 提供对 OpenAI Responses API 的部分支持。该 API 为单轮交互提供了简化的接口。
+AxonHub 支持通过 HTTP 和 WebSocket 使用 OpenAI Responses API。两种渠道端点格式分别为
+HTTP 的 `openai/responses` 和 WebSocket 的 `openai/responses-ws`。两者使用相同的
+Responses 协议，只是传输封装不同。
 
 **端点：**
 - `POST /v1/responses` - 生成响应
+- WebSocket `/v1/responses` - 通过 WebSocket 创建 Responses 流
 
 **能力：**
-- ✅ 支持 `previous_response_id` 透传，但仅限请求路由到原生 Responses 上游；路由到 Chat 或其他兼容上游时返回 `400 invalid_request_error`
+- ✅ 支持基本响应生成和流式响应
+- ✅ 同一渠道内会先选择与入站传输匹配的端点格式
+- ✅ 没有匹配格式时，支持 HTTP 与 WebSocket Responses 之间的转换
+- ✅ 当来源上下文和身份可以验证时，支持通过 `previous_response_id` 继续对话
 - ✅ Responses 请求路由到 Chat 时，需在对应渠道启用 beta 选项 `enableResponsesChatCompat`，才能进行高保真的 namespace 与 custom tool 转换
-- ✅ 基本响应生成完全可用
-- ✅ 支持流式响应
+
+### 端点选择与传输转换
+
+当一个渠道支持两种传输方式时，请将 `openai/responses` 和
+`openai/responses-ws` 配置为两个独立端点。AxonHub 会在同一渠道内优先选择与入站
+格式完全匹配的端点。如果没有允许的同格式端点，则按配置顺序选择第一个允许的端点，
+并转换 HTTP 或 WebSocket 的 Responses 封装。转换会保留 Responses item、提供商的
+response 和 item ID、工具数据、图像操作与结果，以及支持的未知字段。它不会把
+`/v1/images/generations`、`/v1/images/edits` 或 `/v1/models` 转换为 Responses 工具调用。
+
+模型协议覆盖必须引用渠道中已经存在的端点格式。例如：
+
+```json
+{
+  "model": "gpt-5",
+  "apiFormats": ["openai/responses", "openai/responses-ws"],
+  "enabled": true
+}
+```
+
+### 连续对话与恢复
+
+`previous_response_id` 不是可以跨渠道使用的全局令牌。AxonHub 会检查其渠道、端点来源、
+模型、认证身份，以及原生 WebSocket 续接所需的上游连接代次。原生 WebSocket 下一轮会在
+匹配的上游会话中发送增量内容。切换渠道或传输方式时，必须具备经过确认的完整输入历史。
+
+如果所需历史缺失、过期、超出预算或属于其他来源，AxonHub 会在发送上游请求前停止处理，
+返回 HTTP 400，或返回类似下面的 WebSocket 错误：
+
+```json
+{
+  "type": "error",
+  "status": 400,
+  "error": {
+    "type": "invalid_request_error",
+    "code": "previous_response_not_found",
+    "message": "Continuation context is unavailable; resend the full input without previous_response_id."
+  }
+}
+```
+
+此恢复错误不会进入普通渠道故障转移。恢复时，请删除 `previous_response_id` 并重新发送
+完整输入。当前有界默认值为：每条 HTTP 保留记录或流捕获 16 MiB、保留载荷总量 64 MiB、
+每个下游连接的单帧或排队帧 128 MiB。这些数值描述网关的恢复行为，不代表提供商的上下文窗口上限。
+
+原生 Images 始终使用 HTTP 边界。图像生成和编辑使用 OpenAI 兼容的
+`/v1/images/generations` 与 `/v1/images/edits`，模型发现使用 `/v1/models`；这些请求
+不会包装成 Responses `image_generation` 调用。原生 Images 的请求和响应约定请参阅
+[图像生成 API](image-generation.md)。
 
 **示例请求：**
 ```go
@@ -150,6 +203,129 @@ if err := stream.Err(); err != nil {
 
 fmt.Println("\n完整响应:", fullContent.String())
 ```
+
+### OpenAI Decisions API
+
+AxonHub 以原生方式支持 OpenAI Decisions 协议，并提供独立的非流式端点。
+请求发送到 `POST /v1/decisions`，保留 Decisions JSON 结构，不会转换为 Chat
+Completions、Responses 或 SystemOne。
+
+**端点：**
+
+- `POST /v1/decisions` - 使用带类型的问题评估共享输入
+
+**渠道端点配置：**
+
+在需要接收 Decisions 请求的渠道中添加自定义端点，并设置
+`api_format: openai/decisions`。端点可以继承渠道的 `base_url`，也可以提供
+自己的 `base_url`。可选的 `path` 会替换默认路径，且必须以 `/` 开头，例如
+`/v1/decisions`。Decisions 不会回退到 Chat 端点。渠道必须配置兼容的
+`openai/decisions` 端点，才能接收此类请求。
+
+```json
+{
+  "api_format": "openai/decisions",
+  "base_url": "https://decisions.example.test/api",
+  "path": "/v1/decisions"
+}
+```
+
+**请求协议：**
+
+原生请求必须包含 `model`、`input` 和非空的 `questions` 数组。`input` 可以是
+非空字符串，也可以是受支持的消息项数组。文本部分使用 `input_text`，图片
+部分使用 `input_image`；`message` 项可以包含文本或嵌套内容部分。问题和答案
+对象保持原生 JSON 结构，包括未知字段和带类型的 choice 值。
+
+```json
+{
+  "model": "example-decisions-model",
+  "input": "一条虚构的客户报告称包裹完好送达。",
+  "questions": [
+    {
+      "type": "choice",
+      "name": "route",
+      "instructions": "选择最合适的虚构路由标签。",
+      "choices": [
+        { "value": "review", "description": "需要人工审核。" },
+        { "value": "complete", "description": "不需要后续处理。" }
+      ]
+    }
+  ]
+}
+```
+
+**响应和限制：**
+
+- 成功响应以原生 Decisions JSON 返回，并包含 `answers` 数组。答案可以是
+  `choice`、`predicate` 或 `score` 等带类型结果，也可以包含 `refusal` 答案。
+- 第一阶段的 Decisions 仅支持非流式请求。请设置 `stream` 为 `false` 或省略
+  该字段。带有 `"stream": true` 的请求会在本地被拒绝，并返回无效请求错误。
+  此端点不支持 SSE 客户端和 SDK 的流式辅助方法。
+- 如果响应包含 `usage`，只有 `usage.input_tokens` 会映射为 AxonHub 的 prompt
+  用量。output、total、cache 和 reasoning token 字段不会由此协议映射。缺少
+  `usage` 或其值为 null 时，相关用量保持缺失。
+- 提示词保护会按请求应用已配置的提示词保护规则：匹配的规则可以遮盖命中的文本，
+  也可以直接拒绝请求。遮盖分为主路径和条件性的原始回放路径：
+  - 主路径：字符串形式的 `input`，以及 `input[].content[]` 中 `type` 为
+    `input_text` 的部分的 `text`。
+  - 条件性原始回放路径：仅当请求体透传已启用且实际应用、主路径命中的遮盖规则
+    可用，并且额外字段本身也匹配这些规则及其作用域时，遮盖才会作用于独立的
+    `input[].text` 和字符串形式的 `message.content`。透传禁用时，仅遮盖主路径的
+    字符串 `input` 和嵌套 `input_text` 字段。额外形式单独出现时不会产生主路径
+    命中，因而会原样返回。
+  内联图片值和无关的上游字段会保留，但追踪数据不会暴露内联图片字节。
+- 原生 Decisions 请求和响应不会转换为 SystemOne。SystemOne 端点配置属于独立
+  的协议边界，不是 `/v1/decisions` 的回退或兼容路径。
+
+**虚构响应示例：**
+
+```json
+{
+  "model": "example-decisions-model",
+  "answers": [
+    { "type": "choice", "name": "route", "choice": "complete" },
+    { "type": "refusal", "name": "safety_check", "refusal": "not evaluated" }
+  ],
+  "usage": { "input_tokens": 12, "output_tokens": 99 }
+}
+```
+
+**虚构错误示例：**
+
+```json
+{
+  "error": {
+    "message": "decision rate limit",
+    "type": "rate_limit_error",
+    "code": "rate_limit",
+    "x_beta": null
+  }
+}
+```
+
+**虚构的条件性提示词保护示例：**
+
+遮盖 `secret-*` 的规则命中了嵌套的 `input_text` 部分，因此主路径会遮盖它。
+如果请求体透传已启用且实际应用、该命中的遮盖规则可用于原始回放，并且独立的
+`input[].text` 本身也匹配该规则及其作用域，条件性原始回放路径才会同时遮盖它：
+
+```json
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "secret-nested" }]
+    },
+    { "type": "input_text", "text": "secret-standalone" }
+  ]
+}
+```
+
+满足这些条件时，两处 `secret-*` 都会被遮盖。透传禁用时，仅遮盖嵌套的
+`input_text` 字段。如果只存在独立的 `input[].text`，则没有任何主路径
+字段命中，请求会原样返回。
 
 ## API 转换能力
 

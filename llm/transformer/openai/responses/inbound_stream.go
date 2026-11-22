@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -30,6 +31,9 @@ func (t *InboundTransformer) TransformStream(
 	ctx context.Context,
 	stream streams.Stream[*llm.Response],
 ) (streams.Stream[*httpclient.StreamEvent], error) {
+	stream = streams.MapErr(stream, func(resp *llm.Response) (*llm.Response, error) {
+		return mapResponseFunctionNames(resp, false), nil
+	})
 	return &responsesInboundStream{
 		source:              stream,
 		ctx:                 ctx,
@@ -92,6 +96,8 @@ type responsesInboundStream struct {
 	aggregator          *streamAggregator
 	transformerMetadata map[string]any
 	echoResponse        *Response
+	responseHeaders     http.Header
+	responseHeadersSent bool
 
 	// Event queue
 	eventQueue []*httpclient.StreamEvent
@@ -116,6 +122,7 @@ func (s *responsesInboundStream) enqueueEvent(ev *StreamEvent) error {
 		Type: string(ev.Type),
 		Data: eventData,
 	}
+	s.attachResponseHeaders(streamEvent)
 
 	s.eventQueue = append(s.eventQueue, streamEvent)
 
@@ -148,28 +155,7 @@ func (s *responsesInboundStream) Next() bool {
 
 	// Try to get the next chunk from source
 	if !s.source.Next() {
-		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && !s.responseCompleted {
-			if !s.hasFinished {
-				// The upstream ended cleanly without a finish chunk. Close any
-				// open output items and synthesize the terminal event so clients
-				// do not see an abruptly truncated SSE stream.
-				if !s.hasResponseCreated {
-					return s.emitStreamErrorEvent(errors.New("upstream stream ended without producing any response event")) == nil
-				}
-				if err := s.flushPendingReasoning(); err != nil {
-					s.err = err
-					return false
-				}
-				if err := s.closeCurrentContentPart(); err != nil {
-					s.err = err
-					return false
-				}
-				if err := s.closeCurrentOutputItem(); err != nil {
-					s.err = err
-					return false
-				}
-				s.hasFinished = true
-			}
+		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && s.hasFinished {
 			if err := s.enqueueTerminalResponse(); err != nil {
 				s.err = err
 				return false
@@ -209,6 +195,19 @@ func (s *responsesInboundStream) Next() bool {
 	// Handle [DONE] marker
 	if chunk.Object == "[DONE]" {
 		return s.Next() // Try next chunk
+	}
+
+	if headers, ok := responseTransportHeaders(chunk.TransformerMetadata); ok {
+		s.responseHeaders = headers
+	}
+	if raw, ok := rawResponseMetadataEvent(chunk.TransformerMetadata); ok {
+		event := &httpclient.StreamEvent{
+			Type: string(StreamEventTypeResponseMetadata),
+			Data: raw,
+		}
+		s.attachResponseHeaders(event)
+		s.eventQueue = append(s.eventQueue, event)
+		return s.Next()
 	}
 
 	// Initialize response metadata from first chunk
@@ -366,8 +365,11 @@ func (s *responsesInboundStream) Next() bool {
 	}
 
 	// Usage follows the finish_reason; emit the final outcome once both arrive.
-	if chunk.Usage != nil && s.hasFinished && !s.responseCompleted {
-		s.usage = chunk.Usage
+	// The terminal event must wait for the choices-less usage-only chunk that carries the
+	// real counts. Some providers (e.g. ModelScope) attach a zeroed usage object to every
+	// chunk, including the one carrying finish_reason; finalizing there would emit the
+	// placeholder zeros and drop the real counts arriving afterwards.
+	if chunk.Usage != nil && len(chunk.Choices) == 0 && s.hasFinished && !s.responseCompleted {
 		if err := s.enqueueTerminalResponse(); err != nil {
 			s.err = err
 			return false
@@ -462,9 +464,9 @@ func (s *responsesInboundStream) mergeTransformerMetadata(metadata map[string]an
 	}
 
 	if calls := getResponseWebSearchCallsFromMetadata(metadata); len(calls) > 0 {
-		existingCalls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata)
-		mergedCalls := append(existingCalls, calls...)
-		s.transformerMetadata[responsesWebSearchCallsTransformerMetadataKey] = mergedCalls
+		for _, call := range calls {
+			appendResponseWebSearchCallMetadata(s.transformerMetadata, call)
+		}
 	}
 }
 
@@ -501,6 +503,44 @@ func (s *responsesInboundStream) decodeEchoFields(data []byte) {
 	if json.Unmarshal(data, &echo) == nil {
 		s.echoResponse = &echo
 	}
+}
+
+func rawResponseMetadataEvent(metadata map[string]any) ([]byte, bool) {
+	if len(metadata) == 0 {
+		return nil, false
+	}
+
+	value := metadata[responseMetadataTransformerMetadataKey]
+	switch raw := value.(type) {
+	case json.RawMessage:
+		return append([]byte(nil), raw...), len(raw) > 0
+	case []byte:
+		return append([]byte(nil), raw...), len(raw) > 0
+	default:
+		return nil, false
+	}
+}
+
+func responseTransportHeaders(metadata map[string]any) (http.Header, bool) {
+	if len(metadata) == 0 {
+		return nil, false
+	}
+
+	headers, ok := metadata[responseHeadersTransformerMetadataKey].(http.Header)
+	if !ok || len(headers) == 0 {
+		return nil, false
+	}
+
+	return headers.Clone(), true
+}
+
+func (s *responsesInboundStream) attachResponseHeaders(event *httpclient.StreamEvent) {
+	if event == nil || s.responseHeadersSent || len(s.responseHeaders) == 0 {
+		return
+	}
+
+	event.Headers = s.responseHeaders.Clone()
+	s.responseHeadersSent = true
 }
 
 func getResponsesReasoningItemMetadata(metadata map[string]any) (responsesReasoningItemMetadata, bool) {

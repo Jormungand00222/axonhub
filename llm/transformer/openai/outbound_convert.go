@@ -71,18 +71,9 @@ func requestFromLLM(ctx context.Context, r *llm.Request, reasoningField Reasonin
 	req.Tools = lo.FilterMap(r.Tools, func(tool llm.Tool, _ int) (Tool, bool) {
 		return ToolFromLLM(tool), tool.Type == llm.ToolTypeFunction
 	})
-	if r.ToolChoice != nil {
-		req.ToolChoice = &ToolChoice{ToolChoice: r.ToolChoice.ToolChoice}
-		if r.ToolChoice.NamedToolChoice != nil {
-			req.ToolChoice.NamedToolChoice = &NamedToolChoice{
-				Type: r.ToolChoice.NamedToolChoice.Type,
-				Function: ToolFunction{
-					Name: r.ToolChoice.NamedToolChoice.Function.Name,
-				},
-			}
-		}
-	}
+	req.ToolChoice = ToolChoiceFromLLM(r.ToolChoice)
 	if len(req.Tools) == 0 {
+		req.ToolChoice = nil
 		req.ParallelToolCalls = nil
 	}
 	return req, nil
@@ -232,6 +223,8 @@ func requestFromLLMWithResponsesToolAdapterContext(ctx context.Context, r *llm.R
 	}
 
 	if len(req.Tools) == 0 {
+		// Omit optional tool selection when no tools survived conversion.
+		// A required selector cannot be fulfilled and must be reported.
 		req.ParallelToolCalls = nil
 		if req.ToolChoice != nil && req.ToolChoice.ToolChoice != nil {
 			switch *req.ToolChoice.ToolChoice {
@@ -435,7 +428,7 @@ func messageFromLLM(m llm.Message, reasoningField ReasoningField, forUpstreamReq
 	// sanitization marker. Responses headed back to the client keep the empty
 	// string, which every implementation accepts and client-side accumulators
 	// treat as no content.
-	if msg.Role == "assistant" && msg.Content.Content == nil && len(msg.Content.MultipleContent) == 0 {
+	if (msg.Role == "assistant" || len(msg.ToolCalls) > 0) && msg.Content.Content == nil && len(msg.Content.MultipleContent) == 0 {
 		placeholder := ""
 		if forUpstreamRequest {
 			placeholder = emptyAssistantContentPlaceholder
@@ -639,6 +632,35 @@ func flattenChatToolContent(content MessageContent) MessageContent {
 	return MessageContent{Content: &text}
 }
 
+// ToolChoiceFromLLM creates OpenAI ToolChoice from unified llm.ToolChoice.
+func ToolChoiceFromLLM(tc *llm.ToolChoice) *ToolChoice {
+	if tc == nil {
+		return nil
+	}
+
+	choice := &ToolChoice{ToolChoice: tc.ToolChoice}
+
+	if tools, ok := tc.AllowedToolOptions(); ok {
+		return &ToolChoice{
+			NamedToolChoice: &NamedToolChoice{Type: "allowed_tools"},
+			AllowedTools: &AllowedTools{
+				Mode: tc.ToolChoice,
+				Tools: lo.Map(tools, func(o llm.ToolOption, _ int) NamedToolChoice {
+					return NamedToolChoice{Type: o.Type, Function: ToolFunction{Name: o.Name}}
+				}),
+			},
+		}
+	}
+	if tc.NamedToolChoice != nil {
+		choice.NamedToolChoice = &NamedToolChoice{
+			Type:     tc.NamedToolChoice.Type,
+			Function: ToolFunction{Name: tc.NamedToolChoice.Function.Name},
+		}
+	}
+
+	return choice
+}
+
 // ToolFromLLM creates OpenAI Tool from unified llm.Tool.
 func ToolFromLLM(t llm.Tool) Tool {
 	return Tool{
@@ -737,24 +759,31 @@ func (c Choice) ToLLMChoice() llm.Choice {
 		choice.Delta = &delta
 	}
 
-	if c.Logprobs != nil {
-		choice.Logprobs = &llm.LogprobsContent{
-			Content: lo.Map(c.Logprobs.Content, func(t TokenLogprob, _ int) llm.TokenLogprob {
-				return llm.TokenLogprob{
-					Token:   t.Token,
-					Logprob: t.Logprob,
-					Bytes:   t.Bytes,
-					TopLogprobs: lo.Map(t.TopLogprobs, func(tl TopLogprob, _ int) llm.TopLogprob {
-						return llm.TopLogprob{
-							Token:   tl.Token,
-							Logprob: tl.Logprob,
-							Bytes:   tl.Bytes,
-						}
-					}),
-				}
-			}),
-		}
-	}
+	choice.Logprobs = toLLMLogprobs(c.Logprobs)
 
 	return choice
+}
+
+// toLLMLogprobs converts OpenAI Logprobs to unified llm.LogprobsContent.
+func toLLMLogprobs(lp *Logprobs) *llm.LogprobsContent {
+	if lp == nil {
+		return nil
+	}
+
+	return &llm.LogprobsContent{
+		Content: lo.Map(lp.Content, func(t TokenLogprob, _ int) llm.TokenLogprob {
+			return llm.TokenLogprob{
+				Token:   t.Token,
+				Logprob: t.Logprob,
+				Bytes:   t.Bytes,
+				TopLogprobs: lo.Map(t.TopLogprobs, func(tl TopLogprob, _ int) llm.TopLogprob {
+					return llm.TopLogprob{
+						Token:   tl.Token,
+						Logprob: tl.Logprob,
+						Bytes:   tl.Bytes,
+					}
+				}),
+			}
+		}),
+	}
 }

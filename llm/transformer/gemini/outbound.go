@@ -29,6 +29,10 @@ type Config struct {
 	// BaseURL is the base URL for the Gemini API.
 	BaseURL string `json:"base_url,omitempty"`
 
+	// BaseURLProvider can select a request-specific base URL after the API key
+	// provider has selected a credential.
+	BaseURLProvider func(context.Context) string `json:"-"`
+
 	// APIKeyProvider provides API keys for authentication.
 	APIKeyProvider auth.APIKeyProvider `json:"-"`
 
@@ -114,9 +118,9 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	//nolint:exhaustive // Checked.
 	switch llmReq.RequestType {
 	case llm.RequestTypeEmbedding:
-		return t.transformEmbeddingRequest(ctx, llmReq)
+		return t.transformEmbeddingRequest(ctx, llmReq, apiKey)
 	case llm.RequestTypeImage:
-		return t.buildImageGenerationRequest(ctx, llmReq)
+		return t.buildImageGenerationRequest(ctx, llmReq, apiKey)
 	case llm.RequestTypeChat, "":
 		// continue
 	case llm.RequestTypeCompact:
@@ -135,6 +139,15 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 
 	// Convert to Gemini request format with config
 	geminiReq := convertLLMToGeminiRequestWithConfig(llmReq, &t.config)
+
+	// System and developer messages become systemInstruction, so a request made
+	// up only of them leaves contents empty. Gemini requires at least one
+	// content entry; fail here with an error that names the cause instead of
+	// forwarding an empty contents array that upstream rejects without
+	// mentioning the developer role.
+	if len(geminiReq.Contents) == 0 {
+		return nil, fmt.Errorf("%w: contents must contain at least one user or model turn; system and developer messages are converted to systemInstruction", transformer.ErrInvalidRequest)
+	}
 
 	// Clear function call/response IDs for Vertex AI (not supported)
 	if t.config.PlatformType == PlatformVertex {
@@ -168,7 +181,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 
 	// Build URL
-	url := t.buildFullRequestURL(llmReq)
+	url := t.buildFullRequestURLWithContext(ctx, llmReq)
 
 	return &httpclient.Request{
 		Method:                http.MethodPost,
@@ -182,10 +195,24 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}, nil
 }
 
-// buildFullRequestURL constructs the appropriate URL for the Gemini API.
-func (t *OutboundTransformer) buildFullRequestURL(llmReq *llm.Request) string {
+// resolveBaseURL returns the base URL for a request. A per-request provider, when
+// configured, selects a credential-bound base URL (Vertex project and region); it
+// must be consulted after the API key provider so the selection is visible.
+func (t *OutboundTransformer) resolveBaseURL(ctx context.Context) string {
+	if t.config.BaseURLProvider != nil {
+		if requestBaseURL := t.config.BaseURLProvider(ctx); requestBaseURL != "" {
+			return requestBaseURL
+		}
+	}
+
+	return t.config.BaseURL
+}
+
+func (t *OutboundTransformer) buildFullRequestURLWithContext(ctx context.Context, llmReq *llm.Request) string {
+	baseURL := t.resolveBaseURL(ctx)
+
 	if t.config.EndpointPath != "" {
-		return strings.TrimSuffix(t.config.BaseURL, "/") + t.config.EndpointPath
+		return strings.TrimSuffix(baseURL, "/") + t.config.EndpointPath
 	}
 
 	// Determine endpoint based on streaming
@@ -213,7 +240,7 @@ func (t *OutboundTransformer) buildFullRequestURL(llmReq *llm.Request) string {
 	// https://${API_ENDPOINT}/v1/publishers/google/models/${MODEL_ID}:${ACTION}?key=${API_KEY}
 	// If base URL starts with Cloudflare gateway, don't add /v1 prefix
 	if t.config.PlatformType == PlatformVertex {
-		baseURL := strings.TrimSuffix(t.config.BaseURL, "/")
+		baseURL := strings.TrimSuffix(baseURL, "/")
 		if strings.Contains(baseURL, "/v1/") {
 			return fmt.Sprintf("%s/publishers/google/models/%s:%s", baseURL, llmReq.Model, action)
 		}
@@ -222,7 +249,7 @@ func (t *OutboundTransformer) buildFullRequestURL(llmReq *llm.Request) string {
 	}
 
 	// Format: /base_url/{version}/models/{model}:generateContent
-	return fmt.Sprintf("%s/%s/models/%s:%s", t.config.BaseURL, version, llmReq.Model, action)
+	return fmt.Sprintf("%s/%s/models/%s:%s", baseURL, version, llmReq.Model, action)
 }
 
 // TransformResponse transforms the Gemini HTTP response to unified response format.

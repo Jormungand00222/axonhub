@@ -1,7 +1,8 @@
 'use client';
 
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { AlertCircle, Check, ChevronDown, Pencil, Plus, X } from 'lucide-react';
+import { Google } from '@lobehub/icons';
+import { AlertCircle, Check, ChevronDown, Loader2, Pencil, Plus, Radar, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
@@ -22,16 +23,87 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
-import { useUpdateChannelSettings } from '../data/channels';
-import { getAvailableProtocolFormats, getConfigurableApiFormatsForChannelType } from '../data/protocol-options';
+import { cn } from '@/lib/utils';
+import { useDetectChannelEndpoints, useUpdateChannelSettings } from '../data/channels';
+import {
+  buildCodexResponsesEndpoints,
+  getAvailableProtocolFormats,
+  getCodexResponsesWebSocketState,
+  getCodexResponsesWebSocketURL,
+  hasCodexResponsesWebSocketOverrideReplacement,
+  getConfigurableApiFormatsForChannelType,
+  isResponsesFamilyFormat,
+  toHttpBaseURL,
+  translateLegacyCodexModelProtocols,
+} from '../data/protocol-options';
 import {
   Channel,
   ChannelEndpoint,
+  DetectedChannelEndpoint,
   ModelProtocol,
   channelEndpointSchema,
   configurableChannelEndpointApiFormats,
   configurableChannelEndpointApiFormatSchema,
 } from '../data/schema';
+import {
+  RELAY_PROTOCOL_LABEL_KEYS,
+  getChannelRelayProtocols,
+  isRelayProtocol,
+  type RelayProtocol,
+} from '../data/relay-protocols';
+import { ChatProtocolIcon, MessagesProtocolIcon, ResponsesProtocolIcon } from './endpoint-protocol-icons';
+
+const RELAY_PROTOCOL_ICONS: Record<RelayProtocol, React.ComponentType<{ size?: number | string; className?: string }>> = {
+  'openai/chat_completions': ChatProtocolIcon,
+  'openai/responses': ResponsesProtocolIcon,
+  'anthropic/messages': MessagesProtocolIcon,
+  'gemini/contents': Google,
+};
+
+const RELAY_PROTOCOL_ACTIVE_CLASSES: Record<RelayProtocol, string> = {
+  'openai/chat_completions': 'border-sky-500/30 bg-sky-500/15 text-sky-600 dark:text-sky-400',
+  'openai/responses': 'border-violet-500/30 bg-violet-500/15 text-violet-600 dark:text-violet-400',
+  'anthropic/messages': 'border-amber-500/30 bg-amber-500/15 text-amber-600 dark:text-amber-400',
+  'gemini/contents': 'border-emerald-500/30 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
+};
+
+const DETECTION_REASON_KEYS: Record<string, string> = {
+  supported: 'channels.endpoints.detect.reasons.supported',
+  not_found: 'channels.endpoints.detect.reasons.notFound',
+  auth_error: 'channels.endpoints.detect.reasons.authError',
+  rate_limited: 'channels.endpoints.detect.reasons.rateLimited',
+  server_error: 'channels.endpoints.detect.reasons.serverError',
+  unreachable: 'channels.endpoints.detect.reasons.unreachable',
+  invalid_request: 'channels.endpoints.detect.reasons.invalidRequest',
+};
+
+function DetectionResultCard({ result }: { result: DetectedChannelEndpoint }) {
+  const { t } = useTranslation();
+
+  if (!isRelayProtocol(result.apiFormat)) {
+    return null;
+  }
+
+  const Icon = RELAY_PROTOCOL_ICONS[result.apiFormat];
+  const label = t(RELAY_PROTOCOL_LABEL_KEYS[result.apiFormat]);
+  const reasonKey = DETECTION_REASON_KEYS[result.reason] ?? DETECTION_REASON_KEYS.unreachable;
+
+  return (
+    <div
+      className={cn(
+        'flex min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs',
+        result.supported ? RELAY_PROTOCOL_ACTIVE_CLASSES[result.apiFormat] : 'border-border/60 bg-muted/40 text-muted-foreground'
+      )}
+    >
+      <Icon size={14} />
+      <span className='truncate font-medium'>{label}</span>
+      <span className='text-muted-foreground shrink-0'>
+        {result.supported ? t('channels.endpoints.detect.supported') : t(reasonKey)}
+        {!result.supported && result.statusCode ? ` (${result.statusCode})` : ''}
+      </span>
+    </div>
+  );
+}
 
 interface Props {
   channel: Channel;
@@ -40,6 +112,17 @@ interface Props {
 }
 
 const ALLOWED_API_FORMATS = configurableChannelEndpointApiFormatSchema.options;
+const OPENAI_RESPONSES_WEBSOCKET = 'openai/responses-ws';
+// WebSocket Responses endpoints are valid persisted endpoints, but they are not
+// offered as custom endpoints: Codex manages them with its WebSocket checkbox.
+const RECOGNIZED_API_FORMATS: readonly string[] = [...ALLOWED_API_FORMATS, OPENAI_RESPONSES_WEBSOCKET];
+
+// Codex saves canonical Responses endpoints, so legacy WebSocket-only restrictions
+// are edited in their WebSocket identity (mirrors the backend legacy mapping).
+function getInitialModelProtocols(channel: Pick<Channel, 'type' | 'baseURL' | 'endpoints' | 'settings'>): ModelProtocol[] {
+  const protocols = channel.settings?.modelProtocols ?? [];
+  return (channel.type === 'codex' && translateLegacyCodexModelProtocols(channel, protocols)) || protocols;
+}
 
 function ProtocolFormatMultiSelect({
   formats,
@@ -127,7 +210,7 @@ function EndpointTable({
                   {t('channels.endpoints.primaryBadge')}
                 </Badge>
               )}
-              {!readOnly && !ALLOWED_API_FORMATS.includes(ep.apiFormat as (typeof ALLOWED_API_FORMATS)[number]) && (
+              {!readOnly && !RECOGNIZED_API_FORMATS.includes(ep.apiFormat) && (
                 <Badge variant='destructive' className='text-[10px]'>
                   {t('channels.endpoints.unsupportedBadge')}
                 </Badge>
@@ -150,21 +233,31 @@ function EndpointTable({
 export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) {
   const { t } = useTranslation();
   const updateChannelSettings = useUpdateChannelSettings();
+  const detectEndpoints = useDetectChannelEndpoints();
   const [dialogContentElement, setDialogContentElement] = useState<HTMLDivElement | null>(null);
   const wasOpenRef = useRef(false);
 
-  const defaultEndpoints = useMemo(() => channel.defaultEndpoints ?? [], [channel.defaultEndpoints]);
+  const isCodexChannel = channel.type === 'codex';
+  // Codex Responses defaults are projected by the WebSocket checkbox, so only the
+  // remaining built-in defaults are listed and validated as defaults.
+  const defaultEndpoints = useMemo(() => {
+    const defaults = channel.defaultEndpoints ?? [];
+    return channel.type === 'codex' ? defaults.filter((ep) => !isResponsesFamilyFormat(ep.apiFormat)) : defaults;
+  }, [channel.defaultEndpoints, channel.type]);
 
   const [endpoints, setEndpoints] = useState<ChannelEndpoint[]>(() => channel.endpoints ?? []);
   const [newApiFormat, setNewApiFormat] = useState('');
   const [newPath, setNewPath] = useState('');
   const [newBaseURL, setNewBaseURL] = useState('');
-  const [modelProtocols, setModelProtocols] = useState<ModelProtocol[]>(() => channel.settings?.modelProtocols ?? []);
+  const [modelProtocols, setModelProtocols] = useState<ModelProtocol[]>(() => getInitialModelProtocols(channel));
   const [newProtocolModel, setNewProtocolModel] = useState('');
   const [newProtocolFormats, setNewProtocolFormats] = useState<string[]>([]);
   const [editingProtocolModel, setEditingProtocolModel] = useState<string | null>(null);
   const [blockedEndpointRemoval, setBlockedEndpointRemoval] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [detectionResults, setDetectionResults] = useState<DetectedChannelEndpoint[] | null>(null);
+  const initialCodexResponses = useMemo(() => getCodexResponsesWebSocketState(channel), [channel]);
+  const [codexResponsesWebSocket, setCodexResponsesWebSocket] = useState(initialCodexResponses.enabled);
 
   const supportedModelOptions = useMemo(
     () => Array.from(new Set([...channel.supportedModels, ...modelProtocols.map((mp) => mp.model)])).map((model) => ({ value: model, label: model })),
@@ -184,16 +277,18 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
     }
 
     setEndpoints(channel.endpoints ?? []);
+    setCodexResponsesWebSocket(initialCodexResponses.enabled);
     setNewApiFormat('');
     setNewPath('');
     setNewBaseURL('');
-    setModelProtocols(channel.settings?.modelProtocols ?? []);
+    setModelProtocols(getInitialModelProtocols(channel));
     setNewProtocolModel('');
     setNewProtocolFormats([]);
     setEditingProtocolModel(null);
     setBlockedEndpointRemoval(null);
     setError(null);
-  }, [open, channel.endpoints, channel.settings]);
+    setDetectionResults(null);
+  }, [open, channel, initialCodexResponses.enabled]);
 
   const usedApiFormats = useMemo(() => new Set(endpoints.map((ep) => ep.apiFormat)), [endpoints]);
 
@@ -201,6 +296,15 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
     () => getConfigurableApiFormatsForChannelType(channel.type, configurableChannelEndpointApiFormats).filter((f) => !usedApiFormats.has(f)),
     [usedApiFormats, channel.type]
   );
+
+  // Codex saves its Responses family from the checkbox through the same routine as
+  // the channel form; every other channel saves the endpoint list as edited.
+  const savedEndpoints = useMemo(
+    () => (isCodexChannel ? buildCodexResponsesEndpoints(endpoints, codexResponsesWebSocket) : endpoints),
+    [codexResponsesWebSocket, endpoints, isCodexChannel]
+  );
+  const codexWebSocketURL =
+    isCodexChannel && codexResponsesWebSocket ? getCodexResponsesWebSocketURL(toHttpBaseURL(channel.baseURL), endpoints) : undefined;
 
   const handleAddEndpoint = useCallback(() => {
     setError(null);
@@ -255,9 +359,48 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
     [defaultEndpoints, handleRemoveEndpoint, modelProtocols]
   );
 
+  // Disabling WebSocket follows the endpoint removal rule: enabled restrictions
+  // that still use it must be edited first.
+  const handleCodexWebSocketChange = useCallback(
+    (checked: boolean) => {
+      if (!checked && modelProtocols.some((mp) => mp.enabled !== false && mp.apiFormats.includes(OPENAI_RESPONSES_WEBSOCKET))) {
+        setBlockedEndpointRemoval(OPENAI_RESPONSES_WEBSOCKET);
+        return;
+      }
+      setCodexResponsesWebSocket(checked);
+    },
+    [modelProtocols]
+  );
+
+  const handleDetectEndpoints = useCallback(async () => {
+    setError(null);
+
+    try {
+      const results = await detectEndpoints.mutateAsync({ channelID: channel.id });
+      setDetectionResults(results);
+
+      // Add the supported relay protocols that the channel does not expose yet.
+      // Default endpoints are built-in and read-only, so only the override list
+      // is updated. The user still has to save to persist the change.
+      const available = getChannelRelayProtocols(defaultEndpoints, savedEndpoints);
+      const additions = results
+        .filter((result) => result.supported && isRelayProtocol(result.apiFormat) && !available.has(result.apiFormat))
+        .map((result) => channelEndpointSchema.parse({ apiFormat: result.apiFormat }));
+
+      if (additions.length > 0) {
+        setEndpoints((prev) => {
+          const existing = new Set(prev.map((ep) => ep.apiFormat));
+          return [...prev, ...additions.filter((ep) => !existing.has(ep.apiFormat))];
+        });
+      }
+    } catch {
+      // error handled by the hook
+    }
+  }, [channel.id, defaultEndpoints, savedEndpoints, detectEndpoints]);
+
   const availableProtocolFormats = useMemo(() => {
-    return getAvailableProtocolFormats(defaultEndpoints, endpoints);
-  }, [defaultEndpoints, endpoints]);
+    return getAvailableProtocolFormats(defaultEndpoints, savedEndpoints);
+  }, [defaultEndpoints, savedEndpoints]);
 
   const affectedProtocolModels = useMemo(
     () =>
@@ -338,14 +481,14 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
   const handleSave = useCallback(async () => {
     setError(null);
 
-    const apiFormats = endpoints.map((ep) => ep.apiFormat);
+    const apiFormats = savedEndpoints.map((ep) => ep.apiFormat);
     const duplicates = apiFormats.filter((f, i) => apiFormats.indexOf(f) !== i);
     if (duplicates.length > 0) {
       setError(t('channels.endpoints.duplicateError'));
       return;
     }
 
-    const invalidApiFormat = apiFormats.find((format) => !ALLOWED_API_FORMATS.includes(format as (typeof ALLOWED_API_FORMATS)[number]));
+    const invalidApiFormat = apiFormats.find((format) => !RECOGNIZED_API_FORMATS.includes(format));
     if (invalidApiFormat) {
       setError(t('channels.endpoints.invalidApiFormat', 'Unsupported API format'));
       return;
@@ -361,6 +504,10 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
       return;
     }
 
+    // Canonical Codex Responses endpoints inherit the channel Base URL, so a legacy
+    // WS(S) Base URL is saved as its HTTP(S) equivalent.
+    const baseURL = isCodexChannel ? toHttpBaseURL(channel.baseURL) : channel.baseURL;
+
     try {
       // Endpoints and model protocol overrides must be committed together in one
       // update: saving them separately validates each half against the other's
@@ -370,7 +517,8 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
       await updateChannelSettings.mutateAsync({
         id: channel.id,
         input: {
-          endpoints: endpoints.map((ep) => ({
+          ...(baseURL !== channel.baseURL ? { baseURL } : {}),
+          endpoints: savedEndpoints.map((ep) => ({
             apiFormat: ep.apiFormat,
             path: ep.path || undefined,
             baseURL: ep.baseURL || undefined,
@@ -385,7 +533,7 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
     } catch {
       // error handled by hook
     }
-  }, [channel, defaultEndpoints, endpoints, modelProtocols, onOpenChange, updateChannelSettings, t]);
+  }, [channel, defaultEndpoints, isCodexChannel, savedEndpoints, modelProtocols, onOpenChange, updateChannelSettings, t]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -407,6 +555,37 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
         </DialogHeader>
 
         <div className='min-h-0 flex-1 space-y-6 overflow-y-auto py-4'>
+          {isCodexChannel && (
+            <div className='space-y-3'>
+              <label className='text-sm font-medium'>{t('channels.dialogs.fields.apiFormat.label')}</label>
+              <div className='space-y-1 rounded-lg border px-3 py-2.5'>
+                <div className='flex min-h-8 items-center justify-between gap-4'>
+                  <span className='text-sm'>{t('channels.dialogs.fields.apiFormat.formats.openai/responses')}</span>
+                  <label className='flex cursor-pointer items-center gap-2 text-sm'>
+                    <Checkbox
+                      checked={codexResponsesWebSocket}
+                      onCheckedChange={(checked) => handleCodexWebSocketChange(checked === true)}
+                      data-testid='codex-endpoints-websocket-checkbox'
+                    />
+                    <span>{t('channels.dialogs.fields.apiFormat.codexWebSocket.label')}</span>
+                  </label>
+                </div>
+                {codexWebSocketURL && (
+                  <p className='text-muted-foreground text-xs break-all' data-testid='codex-endpoints-websocket-url'>
+                    {t('channels.dialogs.fields.apiFormat.codexWebSocket.derivedURL', { url: codexWebSocketURL })}
+                  </p>
+                )}
+                {codexResponsesWebSocket && (initialCodexResponses.webSocketOnly || hasCodexResponsesWebSocketOverrideReplacement(channel)) && (
+                  <p className='text-xs text-amber-600 dark:text-amber-400' data-testid='codex-endpoints-websocket-upgrade-note'>
+                    {t(initialCodexResponses.webSocketOnly
+                      ? 'channels.dialogs.fields.apiFormat.codexWebSocket.legacyUpgrade'
+                      : 'channels.dialogs.fields.apiFormat.codexWebSocket.overrideReplacement')}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Default endpoints */}
           <div className='space-y-3'>
             <div className='flex items-center justify-between'>
@@ -428,33 +607,65 @@ export function ChannelsEndpointsDialog({ channel, open, onOpenChange }: Props) 
 
           {/* Current configured endpoints */}
           <div className='space-y-3'>
-            <div className='flex items-center justify-between'>
+            <div className='flex items-center justify-between gap-2'>
               <label className='text-sm font-medium'>{t('channels.endpoints.currentEndpoints')}</label>
-              {endpoints.length > 0 && (
-                <span className='text-muted-foreground text-xs'>
-                  {t('channels.endpoints.configuredCount', { count: endpoints.length })}
-                </span>
-              )}
+              <div className='flex items-center gap-2'>
+                {savedEndpoints.length > 0 && (
+                  <span className='text-muted-foreground text-xs'>
+                    {t('channels.endpoints.configuredCount', { count: savedEndpoints.length })}
+                  </span>
+                )}
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  className='h-8'
+                  onClick={handleDetectEndpoints}
+                  disabled={detectEndpoints.isPending}
+                >
+                  {detectEndpoints.isPending ? (
+                    <Loader2 className='mr-1.5 h-3.5 w-3.5 animate-spin' />
+                  ) : (
+                    <Radar className='mr-1.5 h-3.5 w-3.5' />
+                  )}
+                  {t(detectEndpoints.isPending ? 'channels.endpoints.detect.detecting' : 'channels.endpoints.detect.button')}
+                </Button>
+              </div>
             </div>
-            {endpoints.length === 0 ? (
+            <p className='text-muted-foreground text-xs'>{t('channels.endpoints.detect.description')}</p>
+            {savedEndpoints.length === 0 ? (
               <div className='text-muted-foreground rounded-lg border border-dashed p-4 text-center text-sm'>
                 {t('channels.endpoints.noOverridesHint', 'No custom endpoint overrides configured.')}
               </div>
             ) : (
-              <EndpointTable endpoints={endpoints}>
-                {(ep) => (
-                  <Button
-                    type='button'
-                    variant='ghost'
-                    size='sm'
-                    className='hover:text-destructive hover:bg-destructive/10 h-7 w-7 p-0'
-                    onClick={() => handleRequestRemoveEndpoint(ep.apiFormat)}
-                    aria-label={t('channels.endpoints.removeEndpoint', { apiFormat: ep.apiFormat })}
-                  >
-                    <X className='h-3.5 w-3.5' />
-                  </Button>
-                )}
+              <EndpointTable endpoints={savedEndpoints}>
+                {(ep) =>
+                  isCodexChannel && isResponsesFamilyFormat(ep.apiFormat) ? (
+                    <span className='text-muted-foreground text-right text-[10px]'>{t('channels.endpoints.readOnly')}</span>
+                  ) : (
+                    <Button
+                      type='button'
+                      variant='ghost'
+                      size='sm'
+                      className='hover:text-destructive hover:bg-destructive/10 h-7 w-7 p-0'
+                      onClick={() => handleRequestRemoveEndpoint(ep.apiFormat)}
+                      aria-label={t('channels.endpoints.removeEndpoint', { apiFormat: ep.apiFormat })}
+                    >
+                      <X className='h-3.5 w-3.5' />
+                    </Button>
+                  )
+                }
               </EndpointTable>
+            )}
+            {detectionResults && (
+              <div className='bg-muted/20 space-y-2 rounded-lg border p-3'>
+                <p className='text-muted-foreground text-xs'>{t('channels.endpoints.detect.resultTitle')}</p>
+                <div className='flex flex-wrap gap-2'>
+                  {detectionResults.map((result) => (
+                    <DetectionResultCard key={result.apiFormat} result={result} />
+                  ))}
+                </div>
+              </div>
             )}
           </div>
 

@@ -53,9 +53,10 @@ func (t *CompactInboundTransformer) TransformRequest(ctx context.Context, httpRe
 	if req.Model == "" {
 		return nil, fmt.Errorf("%w: model is required", transformer.ErrInvalidRequest)
 	}
+	rawInputItems := parseRawRequestFragments(httpReq.Body).InputItems
 
-	// Reuse convertInputToMessages to convert Input to []llm.Message
-	inputMessages, err := convertInputToMessages(&req.Input)
+	// Convert compact input to unified messages with flat function names.
+	inputMessages, err := convertCompactInputToMessages(&req.Input)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to convert input: %w", transformer.ErrInvalidRequest, err)
 	}
@@ -72,9 +73,38 @@ func (t *CompactInboundTransformer) TransformRequest(ctx context.Context, httpRe
 			PromptCacheKey: req.PromptCacheKey,
 		},
 	}
+	if len(rawInputItems) > 0 {
+		ext := llm.EnsureOpenAIResponsesProviderExtensions(llmReq)
+		if ext != nil {
+			ext.Request = &llm.OpenAIResponsesRequestExtensions{
+				RawInputMessages:        replayMessageSignatures(inputMessages),
+				RawInputItems:           buildRawOnlyInputFragments(req.Input, rawInputItems),
+				OmittedInputItemIndices: buildOmittedInputItemIndices(req.Input),
+			}
+		}
+	}
 	attachOpenAIResponsesRawRequestFields(llmReq, httpReq.Body, rawCompactRequestFields)
 
 	return llmReq, nil
+}
+
+// convertCompactInputToMessages encodes local call names at the compact boundary.
+// Compact shares item decoding with Responses, but has no tool declaration
+// validation step. Preserve that behavior for both compact input and output.
+func convertCompactInputToMessages(input *Input) ([]llm.Message, error) {
+	messages, err := convertInputToMessages(input)
+	if err != nil {
+		return nil, err
+	}
+	for i := range messages {
+		for j := range messages[i].ToolCalls {
+			call := &messages[i].ToolCalls[j]
+			if call.Type == llm.ToolTypeFunction || call.Type == "" {
+				call.Function.Name = flatFunctionName(call.Function.Namespace, call.Function.Name)
+			}
+		}
+	}
+	return messages, nil
 }
 
 // TransformResponse transforms llm.Response to HTTP compact response.

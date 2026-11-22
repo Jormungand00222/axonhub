@@ -403,16 +403,18 @@ func (a *responsesChatToolAdapter) convertMessage(message llm.Message, reasoning
 		default:
 			name := call.Function.Name
 			if call.Function.Namespace != "" {
-				fullName := llm.JoinNamespaceFunctionName(call.Function.Namespace, call.Function.Name)
-				if mapping, ok := a.findMapping(responsesChatToolNamespace, call.Function.Name, call.Function.Namespace); ok {
+				// Older stored calls may still have the local name.
+				member := strings.TrimPrefix(call.Function.Name, call.Function.Namespace+"__")
+				fullName := llm.JoinNamespaceFunctionName(call.Function.Namespace, member)
+				if mapping, ok := a.findMapping(responsesChatToolNamespace, member, call.Function.Namespace); ok {
 					name = mapping.ChatName
 				} else {
 					mapping, ok = a.registerHistoryMapping(
-						toolIdentity{Kind: responsesChatToolNamespace, Name: call.Function.Name, Namespace: call.Function.Namespace},
+						toolIdentity{Kind: responsesChatToolNamespace, Name: member, Namespace: call.Function.Namespace},
 						fullName,
 						responsesChatNamespaceToolHistoryFallbackName,
 						responsesChatToolMapping{
-							Kind: responsesChatToolNamespace, Name: call.Function.Name, Namespace: call.Function.Namespace,
+							Kind: responsesChatToolNamespace, Name: member, Namespace: call.Function.Namespace,
 						},
 					)
 					if !ok {
@@ -461,7 +463,7 @@ func (a *responsesChatToolAdapter) convertToolChoice(choice *llm.ToolChoice) *To
 		return nil
 	}
 	result := &ToolChoice{ToolChoice: choice.ToolChoice}
-	if choice.NamedToolChoice == nil {
+	if _, allowed := choice.AllowedToolOptions(); allowed || choice.NamedToolChoice == nil {
 		if choice.ToolChoice == nil {
 			return nil
 		}
@@ -549,8 +551,7 @@ func llmToolChoiceSignature(choice *llm.ToolChoice) (string, bool) {
 	if choice == nil {
 		return "", false
 	}
-	if choice.AllowedToolsSet {
-		tools := choice.AllowedTools
+	if tools, ok := choice.AllowedToolOptions(); ok {
 		if tools == nil {
 			tools = []llm.ToolOption{}
 		}
@@ -643,12 +644,13 @@ func unsupportedRawChatToolSelector(rawChoice json.RawMessage) (string, bool) {
 // filterAllowedTools applies a Responses allowed_tools constraint after all
 // identities have been mapped, leaving history mappings intact.
 func (a *responsesChatToolAdapter) filterAllowedTools(tools []Tool, choice *llm.ToolChoice) []Tool {
-	if choice == nil || !choice.AllowedToolsSet {
+	options, ok := choice.AllowedToolOptions()
+	if !ok {
 		return tools
 	}
 
-	allowedNames := make(map[string]struct{}, len(choice.AllowedTools))
-	for _, option := range choice.AllowedTools {
+	allowedNames := make(map[string]struct{}, len(options))
+	for _, option := range options {
 		names, ok := a.resolveAllowedTool(option)
 		if !ok {
 			a.addWarningf("unsupported_allowed_tool: dropped unavailable %s tool %q from allowed_tools", option.Type, option.Name)
@@ -1121,7 +1123,7 @@ func restoreResponsesChatMessage(message *llm.Message, mappings map[string]respo
 			call.Type = llm.ToolTypeResponsesToolSearch
 			call.ResponseToolSearchCall = &llm.ResponseToolSearchCall{CallID: call.ID, Execution: mapping.Execution, Arguments: call.Function.Arguments}
 		case responsesChatToolNamespace:
-			call.Function.Name = mapping.Name
+			call.Function.Name = llm.JoinNamespaceFunctionName(mapping.Namespace, mapping.Name)
 			call.Function.Namespace = mapping.Namespace
 		case responsesChatToolClient:
 			call.Function.Name = mapping.Name

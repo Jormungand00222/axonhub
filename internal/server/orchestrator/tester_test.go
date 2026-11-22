@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -14,7 +15,7 @@ import (
 
 // TestBuildTestRequestUsesConfiguredPrompts verifies ordinary channel tests retain their configured prompts.
 func TestBuildTestRequestUsesConfiguredPrompts(t *testing.T) {
-	req := buildChannelTestRequest("test-model", true, "system prompt", "user prompt", false)
+	req := buildChannelTestRequest("test-model", true, "system prompt", "user prompt", false, llm.APIFormatOpenAIChatCompletion)
 
 	require.Equal(t, "test-model", req.Model)
 	require.Len(t, req.Messages, 2)
@@ -28,7 +29,7 @@ func TestBuildTestRequestUsesConfiguredPrompts(t *testing.T) {
 
 // TestBuildTestRequestUsesPingForResponsesWebSocket verifies WebSocket tests use a minimal compatible payload.
 func TestBuildTestRequestUsesPingForResponsesWebSocket(t *testing.T) {
-	req := buildChannelTestRequest("test-model", false, "system prompt", "user prompt", true)
+	req := buildChannelTestRequest("test-model", false, "system prompt", "user prompt", true, llm.APIFormatOpenAIChatCompletion)
 
 	require.Equal(t, "test-model", req.Model)
 	require.Len(t, req.Messages, 1)
@@ -36,6 +37,102 @@ func TestBuildTestRequestUsesPingForResponsesWebSocket(t *testing.T) {
 	require.Equal(t, responsesWebSocketTestPrompt, *req.Messages[0].Content.Content)
 	require.Nil(t, req.MaxCompletionTokens)
 	require.True(t, *req.Stream)
+}
+
+func TestBuildTestRequestUsesDecisionsFormat(t *testing.T) {
+	req := buildChannelTestRequest("gpt-6-luna", true, "ignored", "classify this", false, llm.APIFormatOpenAIDecisions)
+
+	require.Equal(t, llm.RequestTypeDecisions, req.RequestType)
+	require.Equal(t, llm.APIFormatOpenAIDecisions, req.APIFormat)
+	require.NotNil(t, req.Decisions)
+	require.False(t, *req.Stream)
+
+	var body struct {
+		Model     string            `json:"model"`
+		Input     string            `json:"input"`
+		Questions []json.RawMessage `json:"questions"`
+	}
+	require.NoError(t, json.Unmarshal(req.Decisions.Body, &body))
+	require.Equal(t, "gpt-6-luna", body.Model)
+	require.Equal(t, "classify this", body.Input)
+	require.Len(t, body.Questions, 1)
+}
+
+func TestChannelTestAPIFormatPrefersDecisionsEndpoint(t *testing.T) {
+	ch := &biz.Channel{Channel: &ent.Channel{
+		Endpoints: []objects.ChannelEndpoint{
+			{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+			{APIFormat: llm.APIFormatOpenAIDecisions.String()},
+		},
+	}}
+
+	require.Equal(t, llm.APIFormatOpenAIDecisions, channelTestAPIFormat(ch, "gpt-6-luna"))
+}
+
+func TestChannelTestAPIFormatMixedEndpointsFallback(t *testing.T) {
+	ch := &biz.Channel{Channel: &ent.Channel{
+		Type:            channel.TypeOpenai,
+		SupportedModels: []string{"test-model"},
+		Endpoints: []objects.ChannelEndpoint{
+			{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+			{APIFormat: llm.APIFormatTypeSafeSystemOne.String(), Path: "/systemone"},
+		},
+	}}
+	require.Equal(t, llm.APIFormatOpenAIChatCompletion, channelTestAPIFormat(ch, "test-model"))
+}
+
+func TestParseDecisionsTestResponseRequiresAnswers(t *testing.T) {
+	message, err := parseDecisionsTestResponse([]byte(`{"model":"gpt-6-luna","answers":[{"name":"answer","probability":1}]}`))
+	require.NoError(t, err)
+	require.Contains(t, message, `"answers"`)
+
+	_, err = parseDecisionsTestResponse([]byte(`{"model":"gpt-6-luna","answers":[]}`))
+	require.EqualError(t, err, "no answers in Decisions response")
+}
+
+func TestChannelTestAPIFormatUsesModelProtocolPriority(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		formats []string
+		want    llm.APIFormat
+	}{
+		{"chat first", []string{llm.APIFormatOpenAIChatCompletion.String(), llm.APIFormatTypeSafeSystemOne.String()}, llm.APIFormatOpenAIChatCompletion},
+		{"systemone first", []string{llm.APIFormatTypeSafeSystemOne.String(), llm.APIFormatOpenAIChatCompletion.String()}, llm.APIFormatTypeSafeSystemOne},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := &biz.Channel{Channel: &ent.Channel{
+				Type:            channel.TypeOpenai,
+				SupportedModels: []string{"test-model"},
+				Endpoints:       []objects.ChannelEndpoint{{APIFormat: llm.APIFormatTypeSafeSystemOne.String(), Path: "/systemone"}},
+				Settings: &objects.ChannelSettings{
+					ExtraModelPrefix: "alias",
+					ModelProtocols:   []objects.ModelProtocol{{Model: "test-model", APIFormats: tt.formats}},
+				},
+			}}
+			require.Equal(t, tt.want, channelTestAPIFormat(ch, "test-model"))
+			require.Equal(t, tt.want, channelTestAPIFormat(ch, "alias/test-model"))
+		})
+	}
+}
+
+// TestChannelTestAPIFormatCloudflareChannel pins the format the channel test
+// speaks for each model of a Workers AI channel. System One is an extra surface
+// next to the OpenAI-compatible API there, so an unpinned chat or embedding model
+// must not be tested as System One.
+func TestChannelTestAPIFormatCloudflareChannel(t *testing.T) {
+	ch := &biz.Channel{Channel: &ent.Channel{
+		Type:            channel.TypeCloudflare,
+		SupportedModels: []string{"@cf/meta/llama-3.1-8b-instruct", "@cf/cloudflare/clef", "@cf/baai/bge-m3"},
+		Endpoints:       []objects.ChannelEndpoint{{APIFormat: llm.APIFormatTypeSafeSystemOne.String()}},
+		Settings: &objects.ChannelSettings{ModelProtocols: []objects.ModelProtocol{
+			{Model: "@cf/cloudflare/clef", APIFormats: []string{llm.APIFormatTypeSafeSystemOne.String()}},
+			{Model: "@cf/baai/bge-m3", APIFormats: []string{llm.APIFormatOpenAIEmbedding.String()}},
+		}},
+	}}
+
+	require.Equal(t, llm.APIFormatOpenAIChatCompletion, channelTestAPIFormat(ch, "@cf/meta/llama-3.1-8b-instruct"))
+	require.Equal(t, llm.APIFormatTypeSafeSystemOne, channelTestAPIFormat(ch, "@cf/cloudflare/clef"))
+	require.Equal(t, llm.APIFormatOpenAIEmbedding, channelTestAPIFormat(ch, "@cf/baai/bge-m3"))
 }
 
 // TestUsesResponsesWebSocket verifies explicit and URL-inferred WebSocket transports.

@@ -48,6 +48,51 @@ func TestRequestFromLLM(t *testing.T) {
 			},
 		},
 		{
+			name: "request with tool choice but no tools",
+			llmReq: &llm.Request{
+				Model: "deepseek-v3",
+				Messages: []llm.Message{
+					{
+						Role:    "user",
+						Content: llm.MessageContent{Content: lo.ToPtr("hi")},
+					},
+				},
+				ToolChoice: &llm.ToolChoice{ToolChoice: lo.ToPtr("auto")},
+			},
+			validate: func(t *testing.T, req *Request) {
+				require.NotNil(t, req)
+				require.Nil(t, req.ToolChoice)
+			},
+		},
+		{
+			name: "request with tool choice and tools",
+			llmReq: &llm.Request{
+				Model: "deepseek-v3",
+				Messages: []llm.Message{
+					{
+						Role:    "user",
+						Content: llm.MessageContent{Content: lo.ToPtr("hi")},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type: "function",
+						Function: llm.Function{
+							Name:       "lookup",
+							Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+						},
+					},
+				},
+				ToolChoice: &llm.ToolChoice{ToolChoice: lo.ToPtr("required")},
+			},
+			validate: func(t *testing.T, req *Request) {
+				require.NotNil(t, req)
+				require.NotNil(t, req.ToolChoice)
+				require.NotNil(t, req.ToolChoice.ToolChoice)
+				require.Equal(t, "required", *req.ToolChoice.ToolChoice)
+			},
+		},
+		{
 			name: "request with helper fields stripped",
 			llmReq: &llm.Request{
 				Model: "gpt-4",
@@ -732,6 +777,76 @@ func TestMessageFromLLM_ToolCallOnlyMessageKeepsContentField(t *testing.T) {
 	}
 }
 
+// A reasoning-only assistant turn (thinking echoed back without visible text or
+// tool calls) must still serialize a content field. Without it the message carries
+// neither 'content' nor 'tool_calls', and strict OpenAI-compatible upstreams such
+// as llama.cpp reject it ("Expected 'content' or 'tool_calls'").
+func TestMessageFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
+	tests := []struct {
+		name    string
+		message llm.Message
+	}{
+		{
+			name:    "reasoning_content only",
+			message: llm.Message{Role: "assistant", ReasoningContent: lo.ToPtr("thinking step by step")},
+		},
+		{
+			name:    "reasoning only",
+			message: llm.Message{Role: "assistant", Reasoning: lo.ToPtr("thinking step by step")},
+		},
+		{
+			name: "both reasoning fields without content",
+			message: llm.Message{
+				Role:             "assistant",
+				ReasoningContent: lo.ToPtr("thinking step by step"),
+				Reasoning:        lo.ToPtr("thinking step by step"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := MessageFromLLM(tt.message)
+
+			data, err := json.Marshal(msg)
+			require.NoError(t, err)
+
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal(data, &decoded))
+
+			content, ok := decoded["content"]
+			require.True(t, ok, "content field must be present, got %s", data)
+			require.NotNil(t, content, "content must not be null, got %s", data)
+			require.Equal(t, "", content)
+
+			// The reasoning payload itself must survive the normalization.
+			require.Contains(t, decoded, "reasoning_content")
+			require.Equal(t, "thinking step by step", decoded["reasoning_content"])
+		})
+	}
+}
+
+// A reasoning-only turn keeps working across the full request conversion, which is
+// the path an OpenAI-compatible channel actually serializes to the wire.
+func TestRequestFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "local-model",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+			{Role: "assistant", ReasoningContent: lo.ToPtr("thinking step by step")},
+		},
+	}, ReasoningFieldContent)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+
+	assistantMsg := req.Messages[1]
+	require.NotNil(t, assistantMsg.Content.Content, "content must be set for a reasoning-only assistant turn")
+	require.Equal(t, ".", *assistantMsg.Content.Content, "upstream gateways rewrite blank content")
+	require.NotNil(t, assistantMsg.ReasoningContent)
+	require.Equal(t, "thinking step by step", *assistantMsg.ReasoningContent)
+}
+
 // Content that survives conversion must be preserved as-is.
 func TestMessageFromLLM_ToolCallMessageKeepsExistingContent(t *testing.T) {
 	msg := MessageFromLLM(llm.Message{
@@ -904,4 +1019,53 @@ func TestRequestFromLLM_MergesSystemMessages_MultipleContentPrecedence(t *testin
 	require.Equal(t, "You are a coding agent.\n\nUse rg for searches.\n\nSecond scalar", merged)
 	require.NotContains(t, merged, "STALE SCALAR")
 	require.Equal(t, "user", req.Messages[1].Role)
+}
+
+func TestRequestFromLLM_AllowedToolsToolChoice(t *testing.T) {
+	// An allowed_tools choice must keep its mode and tool subset on the Chat
+	// Completions wire; the plain named shape would emit an empty function
+	// name and silently lift the restriction (issue #2504).
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:    "gpt-4o",
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_a", Parameters: []byte(`{"type":"object"}`)}},
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_b", Parameters: []byte(`{"type":"object"}`)}},
+		},
+		ToolChoice: &llm.ToolChoice{
+			ToolChoice:      lo.ToPtr("required"),
+			NamedToolChoice: &llm.NamedToolChoice{Type: "allowed_tools"},
+			Tools:           []llm.ToolOption{{Type: "function", Name: "tool_a"}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.NotNil(t, req.ToolChoice)
+
+	data, err := json.Marshal(req.ToolChoice)
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"tool_a"}}]}}`,
+		string(data))
+}
+
+func TestRequestFromLLM_NamedToolChoiceUnchanged(t *testing.T) {
+	// A named function choice keeps its existing single-tool wire shape.
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:    "gpt-4o",
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_a", Parameters: []byte(`{"type":"object"}`)}},
+		},
+		ToolChoice: &llm.ToolChoice{
+			NamedToolChoice: &llm.NamedToolChoice{Type: "function", Function: llm.ToolFunction{Name: "tool_a"}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.NotNil(t, req.ToolChoice)
+
+	data, err := json.Marshal(req.ToolChoice)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"function","function":{"name":"tool_a"}}`, string(data))
 }

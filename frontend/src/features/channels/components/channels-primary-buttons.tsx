@@ -1,9 +1,9 @@
-import { IconPlus, IconUpload, IconArrowsSort, IconSettings, IconScale } from '@tabler/icons-react';
+import { IconPlus, IconUpload, IconArrowsSort, IconSettings, IconScale, IconTemplate } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/button';
 import { PermissionGuard } from '@/components/permission-guard';
-import { useHorizontalScroll } from '@/hooks/use-horizontal-scroll';
+import { revealFocusedHorizontalButton, useHorizontalScroll } from '@/hooks/use-horizontal-scroll';
 import { useChannels } from '../context/channels-context';
 
 export function ChannelsPrimaryButtons() {
@@ -13,7 +13,7 @@ export function ChannelsPrimaryButtons() {
   const scrollRef = useHorizontalScroll<HTMLDivElement>();
 
   return (
-    <div ref={scrollRef} className='flex gap-2 overflow-x-auto md:overflow-x-visible'>
+    <div ref={scrollRef} onFocusCapture={revealFocusedHorizontalButton} data-testid='channel-actions-scroller' className='flex min-w-0 max-w-full gap-2 overflow-x-auto p-1'>
       <PermissionGuard requiredSystemScope='read_settings'>
         {/* Load Balancing Strategy - navigate to system retry configuration */}
         <Button
@@ -30,6 +30,17 @@ export function ChannelsPrimaryButtons() {
           <span>{t('channels.actions.settings')}</span> <IconSettings size={18} />
         </Button>
       </PermissionGuard>
+
+      {/* Templates are private to the current user, so this is not gated on
+          channel write scope — it matches the per-channel override entry. */}
+      <Button
+        variant='outline'
+        className='shrink-0 space-x-1'
+        onClick={() => setOpen('templates')}
+        data-testid='manage-templates-button'
+      >
+        <span>{t('channels.templates.manager.button')}</span> <IconTemplate size={18} />
+      </Button>
 
       <PermissionGuard requiredScope='write_channels'>
         <>

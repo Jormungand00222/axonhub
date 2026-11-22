@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/samber/lo"
@@ -23,15 +24,24 @@ import (
 var _ transformer.Inbound = (*InboundTransformer)(nil)
 
 // InboundTransformer implements transformer.Inbound for OpenAI Responses API format.
-type InboundTransformer struct{}
+type InboundTransformer struct {
+	webSocket bool
+}
 
 // NewInboundTransformer creates a new OpenAI Responses InboundTransformer.
 func NewInboundTransformer() *InboundTransformer {
 	return &InboundTransformer{}
 }
 
+func NewWebSocketInboundTransformer() *InboundTransformer {
+	return &InboundTransformer{webSocket: true}
+}
+
 // APIFormat returns the API format of the transformer.
 func (t *InboundTransformer) APIFormat() llm.APIFormat {
+	if t.webSocket {
+		return llm.APIFormatOpenAIResponseWebSocket
+	}
 	return llm.APIFormatOpenAIResponse
 }
 
@@ -43,6 +53,15 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 
 	if len(httpReq.Body) == 0 {
 		return nil, fmt.Errorf("%w: request body is empty", transformer.ErrInvalidRequest)
+	}
+	if t.webSocket {
+		body, err := AdaptRequestBody(httpReq.Body, t.APIFormat(), llm.APIFormatOpenAIResponse)
+		if err != nil {
+			return nil, err
+		}
+		cloned := *httpReq
+		cloned.Body = body
+		httpReq = &cloned
 	}
 	if gjson.GetBytes(httpReq.Body, "stream_id").Exists() {
 		return nil, &llm.ResponseError{
@@ -71,7 +90,12 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 		return nil, fmt.Errorf("%w: model is required", transformer.ErrInvalidRequest)
 	}
 
-	return convertToLLMRequest(&req, httpReq.Body)
+	converted, err := convertToLLMRequest(&req, httpReq.Body)
+	if err != nil {
+		return nil, err
+	}
+	converted.APIFormat = t.APIFormat()
+	return converted, nil
 }
 
 // TransformResponse transforms llm.Response to OpenAI Responses API HTTP response.
@@ -81,7 +105,7 @@ func (t *InboundTransformer) TransformResponse(ctx context.Context, chatResp *ll
 	}
 
 	// Convert to Responses API format
-	resp := convertToResponsesAPIResponse(chatResp)
+	resp := convertToResponsesAPIResponse(mapResponseFunctionNames(chatResp, false))
 
 	body, err := json.Marshal(resp)
 	if err != nil {
@@ -236,11 +260,6 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		}
 	}
 
-	// Convert tool choice
-	if req.ToolChoice != nil {
-		chatReq.ToolChoice = convertToolChoiceToLLM(req.ToolChoice)
-	}
-
 	// Convert stream options
 	if req.StreamOptions != nil {
 		chatReq.StreamOptions = &llm.StreamOptions{}
@@ -260,7 +279,7 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		})
 	}
 
-	// Convert input to messages
+	// Decode native tool identities before normalizing their names below.
 	if req.Input.Items != nil {
 		chatReq.TransformOptions.ArrayInputs = lo.ToPtr(true)
 	}
@@ -285,6 +304,8 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 
 		chatReq.Tools = tools
 	}
+	// Preserve tool selection independently of namespace declaration normalization.
+	chatReq.ToolChoice = convertToolChoiceToLLM(req.ToolChoice)
 
 	// additional_tools and client tool_search_output are position-sensitive in
 	// Responses. Promote their definitions for non-Responses downstreams while
@@ -330,11 +351,15 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		chatReq.Verbosity = req.Text.Verbosity
 	}
 
-	if len(rawBody) > 0 {
-		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
+	result, err := flattenRequestFunctionNames(chatReq)
+	if err != nil {
+		return nil, err
 	}
-
-	return chatReq, nil
+	if len(rawBody) > 0 {
+		attachOpenAIResponsesRequestExtensions(result, req, rawBody[0])
+	}
+	result.TransformerMetadata = namespaceMetadata(result)
+	return result, nil
 }
 
 func validateUniqueTopLevelNamespaces(tools []Tool) error {
@@ -359,27 +384,16 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 	if src == nil {
 		return nil
 	}
-
-	result := &llm.ToolChoice{}
-
-	if src.Type != nil && *src.Type == "allowed_tools" {
-		result.ToolChoice = src.Mode
-		result.AllowedToolsSet = true
-		result.AllowedTools = make([]llm.ToolOption, 0, len(src.Tools))
-		for _, tool := range src.Tools {
-			result.AllowedTools = append(result.AllowedTools, llm.ToolOption{Type: tool.Type, Name: tool.Name})
-		}
-	} else if src.Mode != nil {
-		result.ToolChoice = src.Mode
-	} else if src.Type != nil {
+	result := &llm.ToolChoice{ToolChoice: src.Mode}
+	if src.Type != nil {
 		result.NamedToolChoice = &llm.NamedToolChoice{
-			Type: *src.Type,
-		}
-		if src.Name != nil {
-			result.NamedToolChoice.Function.Name = *src.Name
+			Type:     *src.Type,
+			Function: llm.ToolFunction{Name: lo.FromPtr(src.Name)},
 		}
 	}
-
+	for _, opt := range src.Tools {
+		result.Tools = append(result.Tools, llm.ToolOption{Type: opt.Type, Name: opt.Name})
+	}
 	return result
 }
 
@@ -405,9 +419,32 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 
 	// If input is an array of items
 	messages := make([]llm.Message, 0, len(input.Items))
+	// Items already turned into a message. A tool output hoisted next to its
+	// assistant message must not be appended again when the scan reaches it.
+	emitted := make([]bool, len(input.Items))
+	// A repeated call ID starts a new occurrence. Pair each output with its
+	// most recent call before reordering anything.
+	latestCall := make(map[string]int)
+	pairedOutputs := make(map[int][]int)
+	for index, item := range input.Items {
+		if item.CallID == "" {
+			continue
+		}
+		if isToolCallItemType(item.Type) {
+			latestCall[item.CallID] = index
+		} else if callIndex, ok := latestCall[item.CallID]; ok && isToolOutputItemType(item.Type) {
+			pairedOutputs[callIndex] = append(pairedOutputs[callIndex], index)
+			emitted[index] = true
+		}
+	}
 	i := 0
 
 	for i < len(input.Items) {
+		if emitted[i] {
+			i++
+			continue
+		}
+
 		item := &input.Items[i]
 
 		// Handle reasoning item - merge with subsequent function_call or text items
@@ -417,8 +454,18 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 				return nil, err
 			}
 
+			for j := i; j < i+consumed; j++ {
+				emitted[j] = true
+			}
+
 			if msg != nil {
 				messages = append(messages, *msg)
+
+				outputs, err := collectToolCallOutputs(input.Items, pairedOutputs, i, i+consumed)
+				if err != nil {
+					return nil, err
+				}
+				messages = append(messages, outputs...)
 			}
 
 			i += consumed
@@ -430,6 +477,7 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 		// while Chat Completions requires one assistant message containing all
 		// calls before their tool result messages.
 		if isToolCallItemType(item.Type) {
+			start := i
 			msg := llm.Message{Role: "assistant"}
 			for i < len(input.Items) && isToolCallItemType(input.Items[i].Type) {
 				callMessage, err := convertItemToMessage(&input.Items[i])
@@ -442,10 +490,16 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 						msg.ToolCalls = append(msg.ToolCalls, call)
 					}
 				}
+				emitted[i] = true
 				i++
 			}
 			if len(msg.ToolCalls) > 0 {
 				messages = append(messages, msg)
+				outputs, err := collectToolCallOutputs(input.Items, pairedOutputs, start, i)
+				if err != nil {
+					return nil, err
+				}
+				messages = append(messages, outputs...)
 			}
 			continue
 		}
@@ -455,14 +509,18 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 		// requires exactly one tool message per tool_call_id, so merge
 		// consecutive outputs for the same call_id into one tool message.
 		if isToolOutputItemType(item.Type) {
-			merged, consumed, err := mergeToolOutputItems(input.Items, i)
+			end := i + 1
+			for end < len(input.Items) && !emitted[end] && isToolOutputItemType(input.Items[end].Type) {
+				end++
+			}
+			merged, err := mergeToolOutputItems(input.Items[i:end])
 			if err != nil {
 				return nil, err
 			}
 			for _, mergedMessage := range merged {
-				messages = append(messages, *mergedMessage)
+				messages = append(messages, mergedMessage)
 			}
-			i += consumed
+			i = end
 			continue
 		}
 
@@ -476,6 +534,7 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 			messages = append(messages, *msg)
 		}
 
+		emitted[i] = true
 		i++
 	}
 
@@ -504,38 +563,26 @@ func isToolOutputItemType(itemType string) bool {
 	}
 }
 
-// mergeToolOutputItems converts the consecutive tool-output run starting at
-// startIdx into Chat Completions tool messages. Items sharing one call_id are
-// merged into a single message even when other call_ids interleave between
-// them (A, B, A); non-tool-output items terminate the run. Returns one
-// message per call_id in first-appearance order plus the items consumed.
-func mergeToolOutputItems(items []Item, startIdx int) ([]*llm.Message, int, error) {
-	if startIdx >= len(items) {
-		return nil, 0, nil
-	}
-
+// mergeToolOutputItems groups a tool-output run by call ID in first-appearance order.
+func mergeToolOutputItems(items []Item) ([]llm.Message, error) {
 	type toolOutputAccumulator struct {
+		itemID   string
 		parts    []llm.MessageContentPart
 		toolName string
 	}
 
 	order := make([]string, 0)
 	byCallID := make(map[string]*toolOutputAccumulator)
-	consumed := 0
-	for idx := startIdx; idx < len(items); idx++ {
+	for idx := range items {
 		it := &items[idx]
-		if !isToolOutputItemType(it.Type) {
-			break
-		}
 		outMsg, err := convertItemToMessage(it)
 		if err != nil {
-			return nil, consumed, err
+			return nil, err
 		}
-		consumed++
 		if outMsg != nil {
 			acc, ok := byCallID[it.CallID]
 			if !ok {
-				acc = &toolOutputAccumulator{}
+				acc = &toolOutputAccumulator{itemID: outMsg.ID}
 				byCallID[it.CallID] = acc
 				order = append(order, it.CallID)
 			}
@@ -545,16 +592,15 @@ func mergeToolOutputItems(items []Item, startIdx int) ([]*llm.Message, int, erro
 			acc.parts = appendMessageContentParts(acc.parts, outMsg.Content)
 		}
 	}
-	if consumed == 0 {
-		return nil, 0, nil
-	}
 
-	messages := make([]*llm.Message, 0, len(order))
+	messages := make([]llm.Message, 0, len(order))
 	for _, callID := range order {
 		acc := byCallID[callID]
-		messages = append(messages, toolOutputMessage(callID, acc.toolName, acc.parts))
+		msg := toolOutputMessage(callID, acc.toolName, acc.parts)
+		msg.ID = acc.itemID
+		messages = append(messages, *msg)
 	}
-	return messages, consumed, nil
+	return messages, nil
 }
 
 // toolOutputMessage builds one Chat Completions tool message from merged parts.
@@ -597,6 +643,21 @@ func appendMessageContentParts(dst []llm.MessageContentPart, content llm.Message
 		})
 	}
 	return dst
+}
+
+// collectToolCallOutputs hoists each result next to its assistant turn while
+// retaining the original order of the turn's results.
+func collectToolCallOutputs(items []Item, byCall map[int][]int, start, end int) ([]llm.Message, error) {
+	var indices []int
+	for index := start; index < end; index++ {
+		indices = append(indices, byCall[index]...)
+	}
+	slices.Sort(indices)
+	results := make([]Item, 0, len(indices))
+	for _, index := range indices {
+		results = append(results, items[index])
+	}
+	return mergeToolOutputItems(results)
 }
 
 // convertReasoningWithFollowing converts a reasoning item and merges it with subsequent
@@ -826,6 +887,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 		}
 		// Function call output - convert to tool message
 		msg := &llm.Message{
+			ID:         item.ID,
 			Role:       "tool",
 			ToolCallID: lo.ToPtr(item.CallID),
 			Content:    convertToMessageContent(*item.Output, item.Type),
@@ -842,6 +904,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 		}
 		// Custom tool call output - convert to tool message
 		msg := &llm.Message{
+			ID:         item.ID,
 			Role:       "tool",
 			ToolCallID: lo.ToPtr(item.CallID),
 			Content:    convertToMessageContent(*item.Output, item.Type),
@@ -1120,7 +1183,6 @@ func convertToolDeclaration(tool Tool, namespace string) ([]llm.Tool, error) {
 			DeferLoading: tool.DeferLoading,
 		}
 		if namespace != "" {
-			function.Name = llm.JoinNamespaceFunctionName(namespace, tool.Name)
 			function.Namespace = namespace
 		}
 		return []llm.Tool{{Type: "function", Function: function}}, nil
@@ -1129,6 +1191,8 @@ func convertToolDeclaration(tool Tool, namespace string) ([]llm.Tool, error) {
 		return []llm.Tool{{
 			Type: llm.ToolTypeImageGeneration,
 			ImageGeneration: &llm.ImageGeneration{
+				Model:             tool.Model,
+				InputImageMask:    tool.InputImageMask,
 				Background:        tool.Background,
 				InputFidelity:     tool.InputFidelity,
 				Moderation:        tool.Moderation,
@@ -1209,7 +1273,6 @@ func convertToolDeclaration(tool Tool, namespace string) ([]llm.Tool, error) {
 			ResponsesSourceType: tool.Type,
 		}
 		if namespace != "" {
-			converted.Function.Name = llm.JoinNamespaceFunctionName(namespace, tool.Name)
 			converted.Function.Namespace = namespace
 		}
 		return []llm.Tool{converted}, nil

@@ -117,6 +117,24 @@ input SaveChannelEndpointsInput {
   endpoints: [ChannelEndpointInput!]!
 }
 
+# DetectChannelEndpoints probes the upstream for the relay protocols a channel
+# can expose (chat completions, responses, messages) without persisting them.
+input DetectChannelEndpointsInput {
+  channelID: ID!
+  model: String
+}
+
+type DetectedChannelEndpoint {
+  apiFormat: String!
+  supported: Boolean!
+  statusCode: Int
+  reason: String!
+}
+
+type DetectChannelEndpointsPayload {
+  endpoints: [DetectedChannelEndpoint!]!
+}
+
 input ProxyConfigInput {
   type: ProxyType!
   url: String
@@ -193,7 +211,12 @@ type ChannelSettings {
   rateLimit: ChannelRateLimit
   retryableStatusCodes: [Int!]
   retryableErrorPatterns: [RetryableErrorPattern!]
+  maxSingleChannelRetries: Int
+
+  responseTimeout: ChannelResponseTimeout
   modelProtocols: [ModelProtocol!]
+  apiKeyStrategy: String
+  apiKeyRoundRobinSwitchAfter: Int
   providerQuota: ChannelProviderQuotaSettings @goField(forceResolver: true)
   quotaRoutingMode: ChannelQuotaRoutingMode
 }
@@ -203,6 +226,23 @@ enum ChannelQuotaRoutingMode {
   IGNORE_QUOTA
   REMOVE_ON_EXHAUSTED
   BACKPRESSURE
+}
+
+enum ChannelResponseTimeoutMode {
+  INHERIT
+  CUSTOM
+}
+
+type ChannelResponseTimeout {
+  mode: ChannelResponseTimeoutMode
+  streamFirstEventTimeoutSeconds: Int
+  nonStreamResponseTimeoutSeconds: Int
+}
+
+input ChannelResponseTimeoutInput {
+  mode: ChannelResponseTimeoutMode
+  streamFirstEventTimeoutSeconds: Int
+  nonStreamResponseTimeoutSeconds: Int
 }
 
 enum CapabilityPolicy {
@@ -216,6 +256,12 @@ enum APIKeyAutoDisableAction {
   disable_until_cron
   permanent_disable
   permanent_disable_delete
+}
+
+enum APIKeyAutoDisableMode {
+  inherit
+  custom
+  off
 }
 
 type APIKeyAutoDisableRule {
@@ -240,11 +286,13 @@ input APIKeyAutoDisableRuleInput {
 
 type ChannelPolicies {
   stream: CapabilityPolicy
+  apiKeyAutoDisableMode: APIKeyAutoDisableMode
   apiKeyAutoDisableRules: [APIKeyAutoDisableRule!]
 }
 
 input ChannelPoliciesInput {
   stream: CapabilityPolicy
+  apiKeyAutoDisableMode: APIKeyAutoDisableMode
   apiKeyAutoDisableRules: [APIKeyAutoDisableRuleInput!]
 }
 
@@ -269,7 +317,38 @@ input ChannelSettingsInput {
   rateLimit: ChannelRateLimitInput
   retryableStatusCodes: [Int!]
   retryableErrorPatterns: [RetryableErrorPatternInput!]
+  maxSingleChannelRetries: Int
+
+  responseTimeout: ChannelResponseTimeoutInput
   modelProtocols: [ModelProtocolInput!]
+  apiKeyStrategy: String
+  apiKeyRoundRobinSwitchAfter: Int
+  providerQuota: ChannelProviderQuotaSettingsInput
+  quotaRoutingMode: ChannelQuotaRoutingMode
+}
+
+# A partial patch of channel settings. Absent fields keep their stored
+# values; nested objects replace the stored value as a whole. Use this
+# instead of updateChannel's settings input when only some settings change.
+input UpdateChannelSettingsInput {
+  extraModelPrefix: String
+  modelMappings: [ModelMappingInput!]
+  autoTrimedModelPrefixes: [String!]
+  hideOriginalModels: Boolean
+  hideMappedModels: Boolean
+  lowercaseModelId: Boolean
+  proxy: ProxyConfigInput
+  transformOptions: TransformOptionsInput
+  headerOverrideOperations: [OverrideOperationInput!]
+  bodyOverrideOperations: [OverrideOperationInput!]
+  passThroughUserAgent: Boolean
+  passThroughBody: Boolean
+  rateLimit: ChannelRateLimitInput
+  retryableStatusCodes: [Int!]
+  retryableErrorPatterns: [RetryableErrorPatternInput!]
+  modelProtocols: [ModelProtocolInput!]
+  apiKeyStrategy: String
+  apiKeyRoundRobinSwitchAfter: Int
   providerQuota: ChannelProviderQuotaSettingsInput
   quotaRoutingMode: ChannelQuotaRoutingMode
 }
@@ -293,6 +372,7 @@ type ChannelRateLimit {
 type ChannelCredentials {
   apiKey: String
   apiKeys: [String!]
+  vertexApiKeys: [VertexAPIKey!]
   gcp: GCPCredential
   oauth: OAuthCredentials
 }
@@ -314,6 +394,12 @@ type OAuthCredentials {
   scopes: [String!]
 }
 
+type VertexAPIKey {
+  projectID: String!
+  apiKey: String!
+  region: String!
+}
+
 type GCPCredential {
   region: String!
   projectID: String!
@@ -323,6 +409,7 @@ type GCPCredential {
 input ChannelCredentialsInput {
   apiKey: String
   apiKeys: [String!]
+  vertexApiKeys: [VertexAPIKeyInput!]
   gcp: GCPCredentialInput
   oauth: OAuthCredentialsInput
   managementApiKey: String
@@ -335,6 +422,12 @@ input OAuthCredentialsInput {
   expiresAt: Time
   tokenType: String
   scopes: [String!]
+}
+
+input VertexAPIKeyInput {
+  projectID: String!
+  apiKey: String!
+  region: String!
 }
 
 input GCPCredentialInput {
@@ -428,6 +521,24 @@ input BulkUpdateChannelOrderingInput {
 }
 
 type BulkUpdateChannelOrderingResult {
+  success: Boolean!
+  updated: Int!
+  channels: [Channel!]!
+}
+
+enum BulkAutoDisableAction {
+  write_rules
+  inherit
+  off
+}
+
+input BulkUpdateChannelAutoDisableInput {
+  channelIDs: [ID!]!
+  action: BulkAutoDisableAction!
+  rules: [APIKeyAutoDisableRuleInput!]
+}
+
+type BulkUpdateChannelAutoDisablePayload {
   success: Boolean!
   updated: Int!
   channels: [Channel!]!
@@ -600,6 +711,8 @@ input FetchModelsInput {
   channelType: String!
   baseURL: String!
   apiKey: String
+  projectID: String
+  region: String
   channelID: ID
 }
 
@@ -897,7 +1010,9 @@ type Mutation {
   duplicateChannel(sourceID: ID!, input: CreateChannelInput!): Channel!
   bulkCreateChannels(input: BulkCreateChannelsInput!): [Channel!]!
   updateChannel(id: ID!, input: UpdateChannelInput!): Channel!
+  updateChannelSettings(id: ID!, input: UpdateChannelSettingsInput!): Channel!
   saveChannelEndpoints(input: SaveChannelEndpointsInput!): Channel!
+  detectChannelEndpoints(input: DetectChannelEndpointsInput!): DetectChannelEndpointsPayload!
   updateChannelStatus(id: ID!, status: ChannelStatus!): Channel!
   deleteChannel(id: ID!): Boolean!
   bulkArchiveChannels(ids: [ID!]!): Boolean!
@@ -905,6 +1020,9 @@ type Mutation {
   bulkEnableChannels(ids: [ID!]!): Boolean!
   bulkRecoverChannels(ids: [ID!]!): Boolean!
   bulkDeleteChannels(ids: [ID!]!): Boolean!
+  bulkAddChannelTags(ids: [ID!]!, tags: [String!]!): Boolean!
+  bulkRemoveChannelTags(ids: [ID!]!, tags: [String!]!): Boolean!
+  bulkManageChannelTags(ids: [ID!]!, addTags: [String!]!, removeTags: [String!]!): Boolean!
   testChannel(input: TestChannelInput!): TestChannelPayload!
   testChannelAPIKeys(channelID: ID!, modelID: String): TestChannelAPIKeysPayload!
   testChannelAPIKey(channelID: ID!, key: String!, modelID: String): TestAPIKeyResult!
@@ -912,6 +1030,9 @@ type Mutation {
   bulkUpdateChannelOrdering(
     input: BulkUpdateChannelOrderingInput!
   ): BulkUpdateChannelOrderingResult!
+  bulkUpdateChannelAutoDisable(
+    input: BulkUpdateChannelAutoDisableInput!
+  ): BulkUpdateChannelAutoDisablePayload!
 
   # Channel API Key Management
   disableChannelAPIKey(channelID: ID!, key: String!): Boolean!

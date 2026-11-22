@@ -10,11 +10,13 @@ import (
 	"fmt"
 
 	"entgo.io/contrib/entgql"
+	"github.com/samber/lo"
+
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
-	"github.com/samber/lo"
+	"github.com/looplj/axonhub/internal/server/biz"
 )
 
 // ID is the resolver for the id field.
@@ -115,6 +117,14 @@ func (r *channelResolver) ProviderQuotaStatus(ctx context.Context, obj *ent.Chan
 			return nil, fmt.Errorf("failed to load provider quota type: %w", err)
 		}
 		pqs.ProviderType = provider.ProviderType
+	}
+
+	if !biz.IsSupportedProviderQuotaType(pqs.ProviderType.String()) {
+		// Rows created before a provider type was retired (e.g. 'wafer')
+		// remain in the database until purge runs. Surface them as "no
+		// status" instead of an unsupported-type error so one orphan row
+		// cannot break the quota view for every channel.
+		return nil, nil
 	}
 
 	enabled, err := r.systemService.IsProviderQuotaCollectionEnabled(ctx, pqs.ProviderType.String())
@@ -717,6 +727,25 @@ func (r *requestExecutionResolver) ChannelID(ctx context.Context, obj *ent.Reque
 	}, nil
 }
 
+// ChannelAPIKeyIndex is the resolver for the channelAPIKeyIndex field.
+func (r *requestExecutionResolver) ChannelAPIKeyIndex(ctx context.Context, obj *ent.RequestExecution) (*int, error) {
+	if obj.ChannelAPIKeyIndex == nil || obj.ChannelID == 0 {
+		return nil, nil
+	}
+
+	// Mirrors ChannelAPIKeySuffix: the position is only disclosed when the
+	// caller may read the channel it belongs to.
+	ch, err := getNilableChannel(ctx, r.client, obj.ChannelID)
+	if err != nil {
+		return nil, err
+	}
+	if ch == nil {
+		return nil, nil
+	}
+
+	return obj.ChannelAPIKeyIndex, nil
+}
+
 // DataStorageID is the resolver for the dataStorageID field.
 func (r *requestExecutionResolver) DataStorageID(ctx context.Context, obj *ent.RequestExecution) (*objects.GUID, error) {
 	if obj.DataStorageID == 0 {
@@ -728,6 +757,23 @@ func (r *requestExecutionResolver) DataStorageID(ctx context.Context, obj *ent.R
 		Type: ent.TypeDataStorage,
 		ID:   obj.DataStorageID,
 	}, nil
+}
+
+// ChannelAPIKeySuffix is the resolver for the channelAPIKeySuffix field.
+func (r *requestExecutionResolver) ChannelAPIKeySuffix(ctx context.Context, obj *ent.RequestExecution) (*string, error) {
+	if obj.ChannelAPIKeySuffix == nil || obj.ChannelID == 0 {
+		return nil, nil
+	}
+
+	ch, err := getNilableChannel(ctx, r.client, obj.ChannelID)
+	if err != nil {
+		return nil, err
+	}
+	if ch == nil {
+		return nil, nil
+	}
+
+	return obj.ChannelAPIKeySuffix, nil
 }
 
 // RequestBody is the resolver for the requestBody field.

@@ -321,7 +321,7 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "thinking enabled without budget_tokens",
+			name: "thinking enabled with negative budget_tokens",
 			httpReq: &httpclient.Request{
 				Headers: http.Header{
 					"Content-Type": []string{"application/json"},
@@ -330,7 +330,7 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 					"model": "claude-sonnet-4-5-20250929",
 					"max_tokens": 16000,
 					"messages": [{"role": "user", "content": "Hello"}],
-					"thinking": {"type": "enabled"}
+					"thinking": {"type": "enabled", "budget_tokens": -1}
 				}`),
 			},
 			expectError: true,
@@ -573,18 +573,67 @@ func TestInboundTransformer_TransformRequest_ThinkingValidation(t *testing.T) {
 		require.Nil(t, got.ReasoningBudget)
 	})
 
-	t.Run("thinking enabled requires positive budget_tokens", func(t *testing.T) {
+	t.Run("thinking between_tools is accepted", func(t *testing.T) {
+		req := mkReq(`{
+			"model": "claude-sonnet-5-5",
+			"max_tokens": 1024,
+			"messages": [{"role": "user", "content": "Hello"}],
+			"thinking": {"type": "between_tools"}
+		}`)
+
+		got, err := transformer.TransformRequest(t.Context(), req)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.Equal(t, "none", got.ReasoningEffort)
+		require.Nil(t, got.ReasoningBudget)
+		require.Equal(t, "between_tools", got.TransformerMetadata[TransformerMetadataKeyThinkingType])
+	})
+
+	t.Run("thinking between_tools keeps none when output_config.effort is set", func(t *testing.T) {
+		req := mkReq(`{
+			"model": "claude-sonnet-5-5",
+			"max_tokens": 1024,
+			"messages": [{"role": "user", "content": "Hello"}],
+			"thinking": {"type": "between_tools"},
+			"output_config": {"effort": "high"}
+		}`)
+
+		got, err := transformer.TransformRequest(t.Context(), req)
+		require.NoError(t, err)
+		require.Equal(t, "none", got.ReasoningEffort)
+		require.Equal(t, "high", got.TransformerMetadata[TransformerMetadataKeyOutputConfigEffort])
+	})
+
+	t.Run("thinking enabled without budget_tokens defaults to medium", func(t *testing.T) {
+		for _, thinking := range []string{`{"type": "enabled"}`, `{"type": "enabled", "budget_tokens": 0}`} {
+			req := mkReq(`{
+				"model": "glm-4.6",
+				"max_tokens": 1024,
+				"messages": [{"role": "user", "content": "Hello"}],
+				"thinking": ` + thinking + `
+			}`)
+
+			got, err := transformer.TransformRequest(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, "medium", got.ReasoningEffort)
+			require.Nil(t, got.ReasoningBudget)
+			require.Equal(t, "enabled", got.TransformerMetadata[TransformerMetadataKeyThinkingType])
+		}
+	})
+
+	t.Run("thinking enabled requires non-negative budget_tokens", func(t *testing.T) {
 		req := mkReq(`{
 			"model": "claude-sonnet-4-5-20250929",
 			"max_tokens": 1024,
 			"messages": [{"role": "user", "content": "Hello"}],
-			"thinking": {"type": "enabled", "budget_tokens": 0}
+			"thinking": {"type": "enabled", "budget_tokens": -1}
 		}`)
 
 		got, err := transformer.TransformRequest(t.Context(), req)
 		require.Error(t, err)
 		require.Nil(t, got)
-		require.Contains(t, err.Error(), "budget_tokens is required and must be positive")
+		require.Contains(t, err.Error(), "budget_tokens must be positive")
 	})
 
 	t.Run("thinking enabled with positive budget_tokens is accepted", func(t *testing.T) {
@@ -1961,14 +2010,16 @@ func TestConvertToAnthropicResponse_NormalizesOpenAIWebSearchCitationType(t *tes
 
 	resp := convertToAnthropicResponse(chatResp)
 	require.NotNil(t, resp)
-	require.Len(t, resp.Content, 1)
-	require.Equal(t, "text", resp.Content[0].Type)
-	require.Len(t, resp.Content[0].Citations, 1)
+	require.Len(t, resp.Content, 3)
+	require.Equal(t, "server_tool_use", resp.Content[0].Type)
+	require.Equal(t, "web_search_tool_result", resp.Content[1].Type)
+	require.Equal(t, "text", resp.Content[2].Type)
+	require.Len(t, resp.Content[2].Citations, 1)
 	require.Equal(t, TextCitation{
 		Type:  "web_search_result_location",
 		URL:   "https://example.com/search",
 		Title: "Search Result",
-	}, resp.Content[0].Citations[0])
+	}, resp.Content[2].Citations[0])
 }
 
 func TestInboundTransformer_ValidationEdgeCases(t *testing.T) {
@@ -2555,6 +2606,51 @@ func TestInboundTransformer_TransformResponse_EdgeCases(t *testing.T) {
 					tt.validate(t, &anthropicResp)
 				}
 			}
+		})
+	}
+}
+
+func TestConvertToLLMRequest_DisableParallelToolUse(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected *bool
+	}{
+		{
+			name:     "disabled -> parallel_tool_calls false",
+			body:     `{"type": "auto", "disable_parallel_tool_use": true}`,
+			expected: lo.ToPtr(false),
+		},
+		{
+			name:     "explicit enabled -> parallel_tool_calls true",
+			body:     `{"type": "any", "disable_parallel_tool_use": false}`,
+			expected: lo.ToPtr(true),
+		},
+		{
+			name:     "unset -> parallel_tool_calls unset",
+			body:     `{"type": "auto"}`,
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var anthropicReq MessageRequest
+
+			require.NoError(t, json.Unmarshal([]byte(`{
+				"model": "claude-sonnet-4-5-20250929",
+				"max_tokens": 1024,
+				"messages": [{"role": "user", "content": "Hello"}],
+				"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+				"tool_choice": `+tt.body+`
+			}`), &anthropicReq))
+
+			chatReq, err := convertToLLMRequest(&anthropicReq)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, chatReq.ParallelToolCalls)
+
+			// The flag has to survive the round trip back to the Anthropic wire format.
+			require.Equal(t, anthropicReq.ToolChoice.DisableParallelToolUse, convertToAnthropicRequest(chatReq).ToolChoice.DisableParallelToolUse)
 		})
 	}
 }

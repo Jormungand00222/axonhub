@@ -38,6 +38,7 @@ func filterResolvedCandidatesForRequest(
 	promptTokens := estimatePromptTokens(req)
 	stream := reqStream(req)
 	requestFormat := reqAPIFormat(req)
+	reasoningEffort := reqReasoningEffort(req)
 	contentFeatures := detectRequestContentFeatures(req)
 	requestHeaders := buildRequestHeaderMap(req)
 	now := time.Now()
@@ -48,7 +49,7 @@ func filterResolvedCandidatesForRequest(
 			continue
 		}
 
-		if !matchesAssociationWhen(promptTokens, stream, requestFormat, contentFeatures, requestHeaders, now, candidate.when) {
+		if !matchesAssociationWhen(promptTokens, stream, requestFormat, reasoningEffort, contentFeatures, requestHeaders, now, candidate.when) {
 			continue
 		}
 
@@ -85,13 +86,13 @@ func populateAPIFormat(ctx context.Context, candidates []*ChannelModelsCandidate
 			selectedModels := make([]biz.ChannelModelEntry, 0, len(c.Models))
 			selectedFormats := make([]string, 0, len(c.Models))
 			for _, entry := range c.Models {
-				endpoints := applyForcedAPIFormats(ctx, c.Channel, []biz.ChannelModelEntry{entry}, req.Model, baseEndpoints)
+				endpoints := applyForcedAPIFormatsForRequest(ctx, c.Channel, []biz.ChannelModelEntry{entry}, req.Model, req.RequestType, baseEndpoints)
 				format := SelectAPIFormat(endpoints, req)
-				// Alpha Search has no generic fallback. A model whose forced protocol
-				// list cannot serve Alpha Search must not remain as the first retry
+				// Explicit protocols have no generic fallback. A model whose forced protocol
+				// list cannot serve the requested protocol must not remain as the first retry
 				// entry, otherwise an empty candidate format falls back to the channel's
 				// primary (usually chat) outbound.
-				if req.RequestType == llm.RequestTypeAlphaSearch && format == "" {
+				if requiresExplicitEndpoint(req.RequestType) && format == "" {
 					continue
 				}
 
@@ -103,18 +104,18 @@ func populateAPIFormat(ctx context.Context, candidates []*ChannelModelsCandidate
 				continue
 			}
 
-			if req.RequestType == llm.RequestTypeAlphaSearch {
+			if requiresExplicitEndpoint(req.RequestType) {
 				c.Models = selectedModels
 			}
 			c.modelAPIFormats = selectedFormats
 			c.APIFormat = selectedFormats[0]
 		} else {
 			c.modelAPIFormats = nil
-			endpoints := applyForcedAPIFormats(ctx, c.Channel, c.Models, req.Model, baseEndpoints)
+			endpoints := applyForcedAPIFormatsForRequest(ctx, c.Channel, c.Models, req.Model, req.RequestType, baseEndpoints)
 			c.APIFormat = SelectAPIFormat(endpoints, req)
 		}
 
-		if req.RequestType == llm.RequestTypeAlphaSearch && c.APIFormat == "" {
+		if requiresExplicitEndpoint(req.RequestType) && c.APIFormat == "" {
 			continue
 		}
 
@@ -140,6 +141,14 @@ func reqAPIFormat(req *llm.Request) string {
 	return string(req.APIFormat)
 }
 
+func reqReasoningEffort(req *llm.Request) string {
+	if req == nil {
+		return ""
+	}
+
+	return req.ReasoningEffort
+}
+
 type requestContentFeatures struct {
 	hasImage    bool
 	hasVideo    bool
@@ -151,6 +160,7 @@ func matchesAssociationWhen(
 	promptTokens int64,
 	stream bool,
 	requestFormat string,
+	reasoningEffort string,
 	contentFeatures requestContentFeatures,
 	requestHeaders map[string]string,
 	now time.Time,
@@ -165,14 +175,15 @@ func matchesAssociationWhen(
 	}
 
 	if when.Condition != nil && !objects.Evaluate(*when.Condition, map[string]any{
-		objects.ModelAssociationConditionFieldPromptTokens:  promptTokens,
-		objects.ModelAssociationConditionFieldStream:        stream,
-		objects.ModelAssociationConditionFieldRequestFormat: requestFormat,
-		objects.ModelAssociationConditionFieldHasImage:      contentFeatures.hasImage,
-		objects.ModelAssociationConditionFieldHasVideo:      contentFeatures.hasVideo,
-		objects.ModelAssociationConditionFieldHasDocument:   contentFeatures.hasDocument,
-		objects.ModelAssociationConditionFieldHasAudio:      contentFeatures.hasAudio,
-		objects.ModelAssociationConditionFieldRequestHeader: requestHeaders,
+		objects.ModelAssociationConditionFieldPromptTokens:    promptTokens,
+		objects.ModelAssociationConditionFieldStream:          stream,
+		objects.ModelAssociationConditionFieldRequestFormat:   requestFormat,
+		objects.ModelAssociationConditionFieldReasoningEffort: reasoningEffort,
+		objects.ModelAssociationConditionFieldHasImage:        contentFeatures.hasImage,
+		objects.ModelAssociationConditionFieldHasVideo:        contentFeatures.hasVideo,
+		objects.ModelAssociationConditionFieldHasDocument:     contentFeatures.hasDocument,
+		objects.ModelAssociationConditionFieldHasAudio:        contentFeatures.hasAudio,
+		objects.ModelAssociationConditionFieldRequestHeader:   requestHeaders,
 		"now": now,
 	}) {
 		return false

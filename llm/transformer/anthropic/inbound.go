@@ -82,11 +82,12 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 		case "disabled":
 			// valid
 		case "enabled":
-			if anthropicReq.Thinking.BudgetTokens <= 0 {
-				return nil, fmt.Errorf("%w: budget_tokens is required and must be positive when thinking type is enabled", transformer.ErrInvalidRequest)
+			// budget_tokens may be omitted (Z.AI/GLM-style clients); the default is resolved downstream.
+			if anthropicReq.Thinking.BudgetTokens < 0 {
+				return nil, fmt.Errorf("%w: budget_tokens must be positive when thinking type is enabled", transformer.ErrInvalidRequest)
 			}
-		case "adaptive":
-			// output_config is optional for adaptive thinking (defaults to "high" effort upstream)
+		case "adaptive", "between_tools":
+			// output_config is optional for adaptive and between_tools thinking
 			if anthropicReq.OutputConfig != nil && anthropicReq.OutputConfig.Effort != "" {
 				switch anthropicReq.OutputConfig.Effort {
 				case "low", "medium", "high", "xhigh", "max":
@@ -96,7 +97,7 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 				}
 			}
 		default:
-			return nil, fmt.Errorf("%w: thinking.type must be one of: enabled, disabled, adaptive", transformer.ErrInvalidRequest)
+			return nil, fmt.Errorf("%w: thinking.type must be one of: enabled, disabled, adaptive, between_tools", transformer.ErrInvalidRequest)
 		}
 	}
 

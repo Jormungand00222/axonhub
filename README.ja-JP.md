@@ -13,6 +13,7 @@
 [![Lint Status](https://github.com/looplj/axonhub/actions/workflows/lint.yml/badge.svg)](https://github.com/looplj/axonhub/actions/workflows/lint.yml)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/looplj/axonhub?logo=go&logoColor=white)](https://golang.org/)
 [![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://docker.com)
+[![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 
 [English](README.en-US.md) | [中文](README.md) | [日本語](README.ja-JP.md)
 
@@ -20,13 +21,15 @@
 
 ---
 
+> 🚀 **新しく開発している [Reveric（幻界）](https://lj.s.gy/LDfOjx) もぜひお試しください**：小説・脚本から動画の自動生成・自動編集まで、創作の全工程にエージェントが関わる Agent Native 創作ワークスペース。
+
 ## ❤️ スポンサー
 
 <div align="center">
 
 <table width="100%">
   <tr>
-    <td width="50%" align="center" valign="top">
+    <td width="100%" align="center" valign="top">
       <a href="https://apikey.fun/register?aff=axonhub" target="_blank">
         <img src="docs/sponsors/apikey-fun.png" alt="APIKEY.FUN" height="50"/>
         <br/>
@@ -41,29 +44,6 @@
         APIKEY.FUN は、企業や個人開発者に安定・高効率・低コストな AI モデル API 接続を提供する、専門的なエンタープライズ向け AI API 中継サービスです。<br/>
         Claude、OpenAI、Gemini などの人気モデルに対応し、料金は公式価格の 7% からご利用いただけます。<br/>
         AxonHub ユーザーが<a href="https://apikey.fun/register?aff=axonhub" target="_blank">専用リンクから登録</a>すると、チャージ料金が永久に最大 5% 割引になります。
-      </div>
-    </td>
-    <td width="50%" align="center" valign="top">
-      <a href="https://lj.s.gy/DUq59H" target="_blank">
-        <img src="https://www.infistar.cc/logo.png" alt="無限星河 Infistar.cc" height="50"/>
-        <br/>
-        <strong>無限星河 Infistar.cc</strong>
-      </a>
-      <div align="center">
-        <a href="https://lj.s.gy/DUq59H" target="_blank">
-          <img src="docs/sponsors/infistar-banner.png" alt="Infistar.cc 無限星河" width="100%"/>
-        </a>
-      </div>
-      <div align="left">
-        <strong>AxonHub × Infistar.cc 無限星河｜高可用 AI API</strong>
-      </div>
-      <div align="left">
-        ⚡ 安定ルーティング｜公式 1 割 · 透明料金 · フェイルオーバー<br/>
-        🧠 主要モデル｜ChatGPT · Claude · Gemini · Kimi · GLM · DeepSeek<br/>
-        🎨 マルチモーダル｜テキスト · 画像 · 動画 · Embedding / Rerank
-      </div>
-      <div align="left">
-        AxonHub ユーザーは<a href="https://lj.s.gy/DUq59H" target="_blank">専用リンク</a>から特典を利用できます。
       </div>
     </td>
   </tr>
@@ -329,6 +309,12 @@ print(response.choices[0].message.content)
         <sub><b>llc1123</b></sub>
       </a>
     </td>
+    <td align="center">
+      <a href="https://github.com/djdembeck">
+        <img src="https://github.com/djdembeck.png?size=100" width="100" alt="djdembeck"/><br/>
+        <sub><b>djdembeck</b></sub>
+      </a>
+    </td>
   </tr>
 </table>
 
@@ -349,7 +335,7 @@ print(response.choices[0].message.content)
 
 ## 📄 ライセンス
 
-このプロジェクトは複数のライセンス（Apache-2.0およびLGPL-3.0）の下でライセンスされています。詳細なライセンスの概要と条項については、[LICENSE](LICENSE)ファイルを参照してください。
+このプロジェクトは複数のライセンス（Apache-2.0およびLGPL-3.0）の下でライセンスされています。適用範囲は[NOTICE](NOTICE)、ライセンス全文は[LICENSE](LICENSE)および[llm/LICENSE](llm/LICENSE)を参照してください。
 
 ---
 

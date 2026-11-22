@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 )
@@ -93,6 +95,41 @@ func TestAggregateStreamChunks_ToolSearchCallPreservesFinalLifecycleFields(t *te
 	require.Equal(t, "call_search", item.CallID)
 	require.Equal(t, "client", item.Execution)
 	require.JSONEq(t, `{"query":"agents"}`, item.Arguments)
+}
+
+func TestAggregateStreamChunks_TerminalUsageIsExplicitFinal(t *testing.T) {
+	for _, terminal := range []string{"response.completed", "response.failed", "response.incomplete", "response.cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			for _, usage := range []struct {
+				name   string
+				input  int64
+				output int64
+			}{
+				{name: "nonzero", input: 12, output: 34},
+				{name: "zero"},
+			} {
+				t.Run(usage.name, func(t *testing.T) {
+					_, meta, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{{
+						Type: terminal,
+						Data: []byte(`{"type":"` + terminal + `","response":{"id":"resp","status":"failed","usage":{"input_tokens":` + strconv.FormatInt(usage.input, 10) + `,"output_tokens":` + strconv.FormatInt(usage.output, 10) + `,"total_tokens":` + strconv.FormatInt(usage.input+usage.output, 10) + `}}}`),
+					}})
+					require.NoError(t, err)
+					require.Equal(t, llm.AccountingEvidenceExplicitFinal, meta.AccountingEvidence)
+					require.Equal(t, usage.input+usage.output, meta.Usage.TotalTokens)
+				})
+			}
+		})
+	}
+}
+
+func TestAggregateStreamChunks_MissingTerminalUsageIsUnavailable(t *testing.T) {
+	_, meta, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{
+		{Type: "response.in_progress", Data: []byte(`{"type":"response.in_progress","response":{"id":"resp","usage":{"input_tokens":12,"output_tokens":34,"total_tokens":46}}}`)},
+		{Type: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp","status":"completed"}}`)},
+	})
+	require.NoError(t, err)
+	require.Equal(t, llm.AccountingEvidenceUnavailable, meta.AccountingEvidence)
+	require.NotNil(t, meta.Usage)
 }
 
 func TestAggregateStreamChunks_CompletedEventPreservesResponseSnapshot(t *testing.T) {

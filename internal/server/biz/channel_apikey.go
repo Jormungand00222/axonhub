@@ -96,6 +96,7 @@ func (svc *ChannelService) DisableAPIKey(
 		update.SetStatus(channel.StatusDisabled)
 		update.SetErrorMessage(autoDisabledReason)
 		update.SetAutoDisabledAt(autoDisabledAt)
+		update.ClearAutoDisableExpiresAt()
 		log.Warn(ctx, "Channel disabled because all API keys are disabled",
 			log.Int("channel_id", channelID),
 			log.String("channel_name", ch.Name),
@@ -334,13 +335,41 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 		}
 	}
 
+	result := &DeleteDisabledAPIKeysResult{Success: true}
+
+	// Vertex keys are stored as project-bound triples and also surface through
+	// GetAllAPIKeys. Leaving the triple behind would keep the key selectable while
+	// its disable record is gone, so the channel would immediately route through the
+	// credential that was just deleted.
+	if len(newCredentials.VertexAPIKeys) > 0 {
+		keptVertices := make([]objects.VertexAPIKey, 0, len(newCredentials.VertexAPIKeys))
+		removedVertices := make([]objects.VertexAPIKey, 0, len(newCredentials.VertexAPIKeys))
+		for _, credential := range newCredentials.VertexAPIKeys {
+			if _, found := keysToDelete[credential.APIKey]; found {
+				removedVertices = append(removedVertices, credential)
+				continue
+			}
+			keptVertices = append(keptVertices, credential)
+		}
+
+		newCredentials.VertexAPIKeys = keptVertices
+
+		if len(newCredentials.GetAllAPIKeys()) == 0 && len(removedVertices) > 0 {
+			// Restore the first deleted triple in full so the project and region
+			// binding survives the preserve-last-key rule.
+			preservedVertex := removedVertices[0]
+			newCredentials.VertexAPIKeys = append(newCredentials.VertexAPIKeys, preservedVertex)
+			result.Message = "ONE_KEY_PRESERVED"
+		}
+	}
+
 	// Ensure at least one API key remains
-	allKeys := newCredentials.GetAllAPIKeys()
-	if len(allKeys) == 0 {
+	if len(newCredentials.GetAllAPIKeys()) == 0 {
 		// Restore at least one key from the keys being deleted
 		// Prefer the first key that was supposed to be deleted
 		restoredKey := keys[0]
 		newCredentials.APIKeys = []string{restoredKey}
+		result.Message = "ONE_KEY_PRESERVED"
 	}
 
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
@@ -356,12 +385,6 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 		log.Int("channel_id", channelID),
 		log.Int("count", len(keys)),
 	)
-
-	// Check if we had to preserve a key
-	result := &DeleteDisabledAPIKeysResult{Success: true}
-	if len(allKeys) == 0 {
-		result.Message = "ONE_KEY_PRESERVED"
-	}
 
 	svc.asyncReloadChannels()
 
@@ -386,7 +409,7 @@ func applyRecoveredChannelStatus(
 		log.String("channel_name", ch.Name),
 	)
 
-	return update.SetStatus(channel.StatusEnabled).ClearErrorMessage().ClearAutoDisabledAt()
+	return update.SetStatus(channel.StatusEnabled).ClearErrorMessage().ClearAutoDisabledAt().ClearAutoDisableExpiresAt()
 }
 
 // cleanupExpiredDisabledAPIKeys prunes elapsed temporary disables and restores
@@ -425,9 +448,66 @@ func (svc *ChannelService) cleanupExpiredDisabledAPIKeys(ctx context.Context) {
 		needsReload = true
 	}
 
+	if svc.cleanupExpiredAutoDisabledChannels(ctx) {
+		needsReload = true
+	}
+
 	if needsReload {
 		svc.asyncReloadChannels()
 	}
+}
+
+func (svc *ChannelService) cleanupExpiredAutoDisabledChannels(ctx context.Context) bool {
+	now := time.Now()
+	channelIDs, err := svc.entFromContext(ctx).Channel.Query().
+		Where(
+			channel.StatusEQ(channel.StatusDisabled),
+			channel.AutoDisabledAtNotNil(),
+			channel.AutoDisableExpiresAtNotNil(),
+			channel.AutoDisableExpiresAtLTE(now),
+		).
+		IDs(ctx)
+	if err != nil {
+		log.Error(ctx, "Failed to query expired auto-disabled channels", log.Cause(err))
+		return false
+	}
+	if len(channelIDs) == 0 {
+		return false
+	}
+
+	recovered := false
+	for _, channelID := range channelIDs {
+		affected, err := svc.entFromContext(ctx).Channel.Update().
+			Where(
+				channel.ID(channelID),
+				channel.StatusEQ(channel.StatusDisabled),
+				channel.AutoDisabledAtNotNil(),
+				channel.AutoDisableExpiresAtNotNil(),
+				channel.AutoDisableExpiresAtLTE(now),
+			).
+			SetStatus(channel.StatusEnabled).
+			ClearErrorMessage().
+			ClearAutoDisabledAt().
+			ClearAutoDisableExpiresAt().
+			Save(ctx)
+		if err != nil {
+			log.Error(ctx, "Failed to recover expired auto-disabled channel",
+				log.Int("channel_id", channelID),
+				log.Cause(err),
+			)
+			continue
+		}
+		if affected == 0 {
+			continue
+		}
+
+		log.Info(ctx, "Recovered channel after auto-disable expiry",
+			log.Int("channel_id", channelID),
+		)
+		recovered = true
+	}
+
+	return recovered
 }
 
 func (svc *ChannelService) cleanupChannelExpiredDisabledAPIKeys(ctx context.Context, channelID int) (bool, int, error) {

@@ -172,6 +172,60 @@ func TestPersistentOutboundTransformer_TransformRequest_ReasoningEffortMapping(t
 	}
 }
 
+func TestPersistentOutboundTransformer_TransformRequest_UsesModelCardOutputLimit(t *testing.T) {
+	outbound, err := anthropictransformer.NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	channel := &biz.Channel{
+		Channel:  &ent.Channel{ID: 1, Name: "anthropic"},
+		Outbound: outbound,
+		Outbounds: map[string]transformer.Outbound{
+			llm.APIFormatAnthropicMessage.String(): outbound,
+		},
+	}
+	processor := &PersistentOutboundTransformer{
+		wrapped: outbound,
+		state: &PersistenceState{
+			OriginalModel: "glm-5.3",
+			ChannelModelsCandidates: []*ChannelModelsCandidate{{
+				Channel:          channel,
+				Models:           []biz.ChannelModelEntry{{RequestModel: "glm-5.3", ActualModel: "glm-5.3"}},
+				APIFormat:        llm.APIFormatAnthropicMessage.String(),
+				DefaultMaxTokens: 131072,
+			}},
+		},
+	}
+
+	t.Run("injects model card output limit when client omitted max_tokens", func(t *testing.T) {
+		request := &llm.Request{
+			Model: "glm-5.3",
+			Messages: []llm.Message{
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hello")}},
+			},
+		}
+
+		httpRequest, err := processor.TransformRequest(context.Background(), request)
+		require.NoError(t, err)
+		require.Equal(t, int64(131072), gjson.GetBytes(httpRequest.Body, "max_tokens").Int())
+		require.Nil(t, request.MaxTokens)
+		require.Nil(t, request.TransformOptions.DefaultMaxTokens)
+	})
+
+	t.Run("keeps client max_tokens", func(t *testing.T) {
+		request := &llm.Request{
+			Model:     "glm-5.3",
+			MaxTokens: lo.ToPtr(int64(1024)),
+			Messages: []llm.Message{
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hello")}},
+			},
+		}
+
+		httpRequest, err := processor.TransformRequest(context.Background(), request)
+		require.NoError(t, err)
+		require.Equal(t, int64(1024), gjson.GetBytes(httpRequest.Body, "max_tokens").Int())
+	})
+}
+
 func TestPersistentOutboundTransformer_TransformRequest_AppliesSystemCompatibilityPerAttempt(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -406,6 +460,8 @@ func TestPersistentOutboundTransformer_PrepareForRetry(t *testing.T) {
 		processor := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
+				StreamCompleted:        true,
+				OutboundStreamTerminal: streamTerminalFailed,
 				CurrentCandidate: &ChannelModelsCandidate{
 					Channel: channel,
 					Models: []biz.ChannelModelEntry{
@@ -425,6 +481,8 @@ func TestPersistentOutboundTransformer_PrepareForRetry(t *testing.T) {
 		require.NoError(t, err)
 		require.Zero(t, processor.state.CurrentModelIndex)
 		require.Nil(t, processor.state.RequestExec)
+		require.False(t, processor.state.StreamCompleted)
+		require.Equal(t, streamTerminalNone, processor.state.OutboundStreamTerminal)
 	})
 
 	t.Run("multiple models, retry should trigger 'reuse same model' logic", func(t *testing.T) {
@@ -816,7 +874,7 @@ func TestPersistentOutboundTransformer_CanRetry(t *testing.T) {
 		require.False(t, outbound.CanRetry(errSkipCandidateByCircuitBreaker))
 	})
 
-	t.Run("sticky candidate should not trigger same-channel retry", func(t *testing.T) {
+	t.Run("sticky candidate follows normal same-channel retry rules", func(t *testing.T) {
 		outbound := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
@@ -825,13 +883,20 @@ func TestPersistentOutboundTransformer_CanRetry(t *testing.T) {
 					TraceSticky: true,
 					Models: []biz.ChannelModelEntry{
 						{RequestModel: "gpt-4", ActualModel: "gpt-4"},
-						{RequestModel: "gpt-4", ActualModel: "gpt-4-alternative"},
 					},
 				},
 			},
 		}
 
-		require.False(t, outbound.CanRetry(retryableErr))
+		require.True(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusInternalServerError}))
+		require.True(t, outbound.CanRetry(pipeline.ErrEmptyResponse))
+		require.False(t, outbound.CanRetry(nonRetryableErr))
+		require.False(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusTooManyRequests}))
+		require.False(t, outbound.CanRetry(errSkipCandidateByCircuitBreaker))
+
+		outbound.state.CurrentCandidate.Models = append(outbound.state.CurrentCandidate.Models,
+			biz.ChannelModelEntry{RequestModel: "gpt-4", ActualModel: "gpt-4-alternative"})
+		require.True(t, outbound.CanRetry(nonRetryableErr), "sticky channels can retry another mapped model")
 	})
 
 	t.Run("auto-aggregate empty errors are retryable", func(t *testing.T) {
@@ -853,6 +918,39 @@ func TestPersistentOutboundTransformer_CanRetry(t *testing.T) {
 
 			require.True(t, outbound.CanRetry(retryErr))
 		}
+	})
+
+	// A channel that lists 429 asks for a same-channel retry on a rate limit. The
+	// candidate keeps a single mapped model so the decision is about the 429
+	// branch itself — with a second model the retry is also allowed for "try the
+	// next mapped model".
+	t.Run("a channel that lists 429 opts a rate limit into same-channel retry", func(t *testing.T) {
+		optInChannel := &biz.Channel{
+			Channel: &ent.Channel{
+				ID:       2,
+				Name:     "opt-in-channel",
+				Settings: &objects.ChannelSettings{RetryableStatusCodes: []int{http.StatusTooManyRequests}},
+			},
+			Outbound: &mockTransformer{},
+		}
+		newOutbound := func(ch *biz.Channel) *PersistentOutboundTransformer {
+			return &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{
+						Channel: ch,
+						Models:  []biz.ChannelModelEntry{{RequestModel: "gpt-4", ActualModel: "gpt-4"}},
+					},
+				},
+			}
+		}
+
+		require.True(t, newOutbound(optInChannel).CanRetry(&httpclient.Error{StatusCode: http.StatusTooManyRequests}))
+		require.True(t, newOutbound(optInChannel).CanRetry(&llm.ResponseError{StatusCode: http.StatusTooManyRequests}))
+
+		// Without 429 in the list a rate limit still switches channels.
+		require.False(t, newOutbound(channel).CanRetry(&httpclient.Error{StatusCode: http.StatusTooManyRequests}))
+		require.False(t, newOutbound(channel).CanRetry(&llm.ResponseError{StatusCode: http.StatusTooManyRequests}))
 	})
 }
 
@@ -904,9 +1002,46 @@ func TestShouldForceStreamingForCandidate(t *testing.T) {
 	})
 }
 
+func TestPersistentOutboundTransformer_TransformRequest_PreservesNonStreaming(t *testing.T) {
+	outbound, err := anthropictransformer.NewOutboundTransformer("https://api.example.com", "test-api-key")
+	require.NoError(t, err)
+
+	channel := &biz.Channel{
+		Channel:  &ent.Channel{ID: 1, Name: "custom-anthropic"},
+		Outbound: outbound,
+		Outbounds: map[string]transformer.Outbound{
+			llm.APIFormatAnthropicMessage.String(): outbound,
+		},
+	}
+	processor := &PersistentOutboundTransformer{
+		wrapped: outbound,
+		state: &PersistenceState{
+			OriginalModel: "MiniMax-M2.7",
+			ChannelModelsCandidates: []*ChannelModelsCandidate{{
+				Channel:   channel,
+				Models:    []biz.ChannelModelEntry{{RequestModel: "MiniMax-M2.7", ActualModel: "MiniMax-M2.7"}},
+				APIFormat: llm.APIFormatAnthropicMessage.String(),
+			}},
+		},
+	}
+	request := &llm.Request{
+		Model:     "MiniMax-M2.7",
+		APIFormat: llm.APIFormatAnthropicMessage,
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("Hi")},
+		}},
+	}
+
+	httpRequest, err := processor.TransformRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, gjson.GetBytes(httpRequest.Body, "stream").Exists())
+	require.False(t, gjson.GetBytes(httpRequest.Body, "stream").Bool())
+}
+
 func TestIsCompletedAggregatedOutboundResponse(t *testing.T) {
 	t.Run("usage with completion tokens means completed", func(t *testing.T) {
-		require.True(t, isCompletedAggregated(llm.ResponseMeta{Usage: &llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}))
+		require.False(t, isCompletedAggregated(llm.ResponseMeta{Usage: &llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}))
 	})
 
 	t.Run("usage with zero completion tokens is not completed", func(t *testing.T) {
@@ -915,6 +1050,7 @@ func TestIsCompletedAggregatedOutboundResponse(t *testing.T) {
 
 	t.Run("response id without usage is not completed", func(t *testing.T) {
 		require.False(t, isCompletedAggregated(llm.ResponseMeta{ID: "resp_123"}))
+		require.True(t, isCompletedAggregated(llm.ResponseMeta{Completed: true}))
 	})
 
 	t.Run("explicit completed flag is completed", func(t *testing.T) {
@@ -963,6 +1099,9 @@ func (s *sliceEventStream) Close() error {
 	return nil
 }
 
+// TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling
+// verifies that aggregated Responses chunks and terminal events produce the
+// correct request execution completion status.
 func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t *testing.T) {
 	ctx := context.Background()
 	ctx = authz.WithTestBypass(ctx)
@@ -1032,6 +1171,63 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		// Incomplete streams must still persist buffered chunks for debugging.
 		require.Len(t, dbExec.ResponseChunks, 1, "failed execution should keep response_chunks in DB")
 	})
+	t.Run("response failure terminal is not completed", func(t *testing.T) {
+		client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+		defer client.Close()
+
+		ctx := ent.NewContext(ctx, client)
+		project := createTestProject(t, ctx, client)
+		ch := createTestChannel(t, ctx, client)
+		_, requestService, _, usageLogService := setupTestServices(t, client)
+
+		req, err := client.Request.Create().
+			SetProjectID(project.ID).
+			SetChannelID(ch.ID).
+			SetModelID("gpt-4.1").
+			SetStatus(request.StatusPending).
+			SetRequestBody([]byte(`{"stream":true}`)).
+			Save(ctx)
+		require.NoError(t, err)
+
+		exec, err := client.RequestExecution.Create().
+			SetRequestID(req.ID).
+			SetProjectID(project.ID).
+			SetChannelID(ch.ID).
+			SetModelID("gpt-4.1").
+			SetRequestBody([]byte(`{"stream":true}`)).
+			SetFormat("openai/responses").
+			SetStatus(requestexecution.StatusPending).
+			SetStream(true).
+			Save(ctx)
+		require.NoError(t, err)
+
+		stream := &sliceEventStream{
+			events: []*httpclient.StreamEvent{{
+				Type: "response.failed",
+				Data: []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed"}}`),
+			}},
+		}
+		transformer := &mockTransformer{
+			apiFormat:          llm.APIFormatOpenAIResponse,
+			aggregatedResponse: []byte(`{"id":"resp_failed","status":"completed"}`),
+			aggregatedMeta: llm.ResponseMeta{
+				ID:    "resp_failed",
+				Usage: &llm.Usage{CompletionTokens: 1},
+			},
+		}
+		state := &PersistenceState{}
+
+		persistentStream := NewOutboundPersistentStream(ctx, stream, req, exec, requestService, usageLogService, transformer, nil, state)
+		require.True(t, persistentStream.Next())
+		_ = persistentStream.Current()
+		require.False(t, state.StreamCompleted)
+		require.NoError(t, persistentStream.Close())
+
+		dbExec, err := client.RequestExecution.Get(ctx, exec.ID)
+		require.NoError(t, err)
+		require.Equal(t, requestexecution.StatusFailed, dbExec.Status)
+		require.NotEqual(t, requestexecution.StatusCompleted, dbExec.Status)
+	})
 
 	t.Run("aggregated completed response without terminal event is completed", func(t *testing.T) {
 		client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
@@ -1071,7 +1267,8 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 			apiFormat:          llm.APIFormatOpenAIResponse,
 			aggregatedResponse: aggregated,
 			aggregatedMeta: llm.ResponseMeta{
-				ID: "resp_456",
+				ID:        "resp_456",
+				Completed: true,
 				Usage: &llm.Usage{
 					PromptTokens:     10,
 					CompletionTokens: 2,
@@ -1092,10 +1289,10 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		require.Equal(t, requestexecution.StatusCompleted, dbExec.Status)
 		require.JSONEq(t, string(aggregated), string(dbExec.ResponseBody))
 		require.Equal(t, "resp_456", dbExec.ExternalID)
-		require.True(t, state.StreamCompleted)
+		require.False(t, state.StreamCompleted)
 	})
 
-	t.Run("canceled client with aggregated completed response is still completed", func(t *testing.T) {
+	t.Run("canceled client with aggregated response remains canceled", func(t *testing.T) {
 		client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 		defer client.Close()
 
@@ -1155,13 +1352,12 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 
 		dbExec, err := client.RequestExecution.Get(baseCtx, exec.ID)
 		require.NoError(t, err)
-		require.Equal(t, requestexecution.StatusCompleted, dbExec.Status)
-		require.JSONEq(t, string(aggregated), string(dbExec.ResponseBody))
-		require.Equal(t, "resp_codex_like", dbExec.ExternalID)
-		require.True(t, state.StreamCompleted)
+		require.Equal(t, requestexecution.StatusCanceled, dbExec.Status)
+		require.NotEqual(t, "resp_codex_like", dbExec.ExternalID)
+		require.False(t, state.StreamCompleted)
 	})
 
-	t.Run("canceled client after finish reason is still completed without done or usage", func(t *testing.T) {
+	t.Run("canceled client after finish reason remains completed from terminal evidence", func(t *testing.T) {
 		client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 		defer client.Close()
 
@@ -1207,7 +1403,7 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		persistentStream := NewOutboundPersistentStream(requestCtx, stream, req, exec, requestService, usageLogService, transformer, nil, state)
 		require.True(t, persistentStream.Next())
 		require.Equal(t, finalChunk, persistentStream.Current())
-		require.True(t, state.StreamCompleted)
+		require.False(t, state.StreamCompleted)
 
 		// Simulate the agent closing its SSE request immediately after consuming
 		// the final semantic response, before a trailing [DONE] can be consumed.
@@ -1220,6 +1416,61 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		require.Empty(t, dbExec.ErrorMessage)
 		require.JSONEq(t, string(aggregated), string(dbExec.ResponseBody))
 	})
+}
+
+func TestOutboundPersistentStream_Close_AnthropicStopReasonAfterStreamErrorCompletesExecution(t *testing.T) {
+	ctx := authz.WithTestBypass(context.Background())
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx = ent.NewContext(ctx, client)
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	_, requestService, _, usageLogService := setupTestServices(t, client)
+	req, err := client.Request.Create().
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("claude-opus-5-5").
+		SetStatus(request.StatusPending).
+		SetRequestBody([]byte(`{"stream":true}`)).
+		Save(ctx)
+	require.NoError(t, err)
+	exec, err := client.RequestExecution.Create().
+		SetRequestID(req.ID).
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("claude-opus-5-5").
+		SetRequestBody([]byte(`{"stream":true}`)).
+		SetFormat("anthropic/messages").
+		SetStatus(requestexecution.StatusPending).
+		SetStream(true).
+		Save(ctx)
+	require.NoError(t, err)
+
+	stream := &sliceEventStream{
+		events: []*httpclient.StreamEvent{
+			{Data: []byte(`{"type":"message_start","message":{"id":"msg_stop","type":"message","role":"assistant","content":[],"model":"claude-opus-5-5"}}`)},
+			{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`)},
+			{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+		},
+		err: io.ErrUnexpectedEOF,
+	}
+	outbound, err := anthropictransformer.NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	state := &PersistenceState{}
+	persistentStream := NewOutboundPersistentStream(ctx, stream, req, exec, requestService, usageLogService, outbound, nil, state)
+
+	for persistentStream.Next() {
+		_ = persistentStream.Current()
+	}
+	require.ErrorIs(t, persistentStream.Err(), io.ErrUnexpectedEOF)
+	require.NoError(t, persistentStream.Close())
+
+	savedExec, err := client.RequestExecution.Get(ctx, exec.ID)
+	require.NoError(t, err)
+	require.Equal(t, requestexecution.StatusCompleted, savedExec.Status)
+	require.Equal(t, "msg_stop", savedExec.ExternalID)
+	require.False(t, state.StreamCompleted)
 }
 
 func TestOutboundPersistentStream_Close_ResponsesTerminalPersistsOutcome(t *testing.T) {
@@ -2194,4 +2445,51 @@ func TestOutboundPersistentStream_Close_TransportErrorKeepsMetricsAndClassifiesE
 	require.Equal(t, int64(400), *dbExec.MetricsFirstTokenLatencyMs)
 	require.NotNil(t, dbExec.MetricsLatencyMs)
 	require.GreaterOrEqual(t, *dbExec.MetricsLatencyMs, int64(1500))
+}
+
+func TestPersistentOutboundTransformer_RetrySelectionCounts(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:retry-counts?mode=memory&_fk=0")
+	defer client.Close()
+	ctx := context.Background()
+	service := biz.NewChannelServiceForTest(client)
+	defer service.Stop()
+	first := &ChannelModelsCandidate{
+		Channel: &biz.Channel{Channel: &ent.Channel{ID: 1}, Outbound: &mockTransformer{}},
+		Models:  []biz.ChannelModelEntry{{ActualModel: "model-a"}, {ActualModel: "model-b"}},
+	}
+	second := &ChannelModelsCandidate{
+		Channel: &biz.Channel{Channel: &ent.Channel{ID: 2}, Outbound: &mockTransformer{}},
+		Models:  []biz.ChannelModelEntry{{ActualModel: "model-c"}},
+	}
+	policy := &mockRetryPolicyProvider{policy: &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 1}}
+	lb := NewLoadBalancer(policy, service)
+	candidates := (&LoadBalancedSelector{}).sortCandidates(ctx, lb,
+		[]*ChannelModelsCandidate{first, second}, &llm.Request{Model: "model"}, 2, true)
+	require.Same(t, first, candidates[0])
+	processor := &PersistentOutboundTransformer{
+		wrapped: first.Channel.Outbound,
+		state: &PersistenceState{
+			ChannelService: service, CurrentCandidate: first, ChannelModelsCandidates: candidates,
+		},
+	}
+	assertCounts := func(firstCount, secondCount int64) {
+		t.Helper()
+		for id, want := range map[int]int64{1: firstCount, 2: secondCount} {
+			metrics, err := service.GetChannelMetrics(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, want, metrics.RequestCount, "channel %d", id)
+		}
+	}
+	assertCounts(1, 0)
+	require.NoError(t, processor.PrepareForRetry(ctx)) // next model, same channel
+	require.Equal(t, 1, processor.state.CurrentModelIndex)
+	assertCounts(2, 0)
+	require.NoError(t, processor.PrepareForRetry(ctx)) // same model, same channel
+	assertCounts(3, 0)
+	require.NoError(t, processor.NextChannel(ctx))
+	assertCounts(3, 1)
+	require.NoError(t, processor.PrepareForRetry(ctx))
+	assertCounts(3, 2)
+	require.Error(t, processor.NextChannel(ctx)) // exhausted candidates are not attempts
+	assertCounts(3, 2)
 }

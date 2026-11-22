@@ -108,7 +108,7 @@ func requireNonStreamRestoration(t *testing.T, outbound Outbound, httpRequest *h
 
 	lookup := response.Choices[0].Message.ToolCalls[0]
 	require.Equal(t, llm.ToolTypeFunction, lookup.Type)
-	require.Equal(t, "lookup", lookup.Function.Name)
+	require.Equal(t, "functions__lookup", lookup.Function.Name)
 	require.Equal(t, "functions", lookup.Function.Namespace)
 
 	patch := response.Choices[0].Message.ToolCalls[1]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -82,6 +83,37 @@ func TestOverrideParametersWithTemplate(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "header-gpt-4", processedRequestWithHeaders.Headers.Get("X-Custom-Model"))
+}
+
+func TestOverrideParametersWithMappedRequestModel(t *testing.T) {
+	ctx := context.Background()
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "mapped-model-test",
+			Settings: &objects.ChannelSettings{
+				BodyOverrideOperations: []objects.OverrideOperation{{
+					Op:        "set",
+					Path:      "service_tier",
+					Value:     "priority",
+					Condition: `{{or (eq .RequestModel "gpt-4-fast") (eq .RequestModel "gpt-4-priority")}}`,
+				}},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       &llm.Request{Model: "gpt-4"},
+			OriginalModel:    "gpt-4-fast",
+		},
+	}
+
+	processedRequest, err := applyOverrideRequestBody(outbound).OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(`{"model":"gpt-4"}`)})
+	require.NoError(t, err)
+	require.Equal(t, "priority", gjson.GetBytes(processedRequest.Body, "service_tier").String())
 }
 
 func TestOverrideParametersWithRequestHeaderTemplate(t *testing.T) {
@@ -2035,6 +2067,105 @@ func TestOverrideBodySetIfAbsent(t *testing.T) {
 	}
 }
 
+// TestOverrideBodySetIfAbsentOriginalRequest covers https://github.com/looplj/axonhub/issues/2133:
+// the outbound body is produced by format transformation, so a field the client sent may not
+// survive it (e.g. Anthropic `thinking` mapped to `reasoning_effort`). set_if_absent must treat
+// a field present in the original inbound request body as present.
+func TestOverrideBodySetIfAbsentOriginalRequest(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		originalBody string
+		body         string
+		op           objects.OverrideOperation
+		expected     string
+	}{
+		{
+			name:         "preserves field sent by client but dropped by transformation",
+			originalBody: `{"model":"deepseek-v4-flash","thinking":{"type":"enabled","budget_tokens":13312}}`,
+			body:         `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+		},
+		{
+			name:         "preserves explicit null sent by client",
+			originalBody: `{"thinking":null}`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{}`,
+		},
+		{
+			name:         "preserves nested field sent by client",
+			originalBody: `{"generation":{"max_output_tokens":16000}}`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected:     `{}`,
+		},
+		{
+			name:         "sets default when absent from both bodies",
+			originalBody: `{"model":"deepseek-v4-flash"}`,
+			body:         `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"model":"deepseek-v4-flash","reasoning_effort":"high","thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:         "preserves field present only in transformed body",
+			originalBody: `{}`,
+			body:         `{"max_output_tokens":8000}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected:     `{"max_output_tokens":8000}`,
+		},
+		{
+			name:         "ignores non-JSON original body",
+			originalBody: `not-json`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:         "sets default when no original request is recorded",
+			originalBody: "",
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"thinking":{"type":"disabled"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llmRequest := &llm.Request{Model: "deepseek-v4-flash"}
+			if tt.originalBody != "" {
+				llmRequest.RawRequest = &httpclient.Request{Body: []byte(tt.originalBody)}
+			}
+
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "set-if-absent-original-test",
+					Settings: &objects.ChannelSettings{
+						BodyOverrideOperations: []objects.OverrideOperation{tt.op},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       llmRequest,
+					OriginalModel:    llmRequest.Model,
+				},
+			}
+
+			middleware := applyOverrideRequestBody(outbound)
+			result, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(tt.body)})
+			require.NoError(t, err)
+			require.JSONEq(t, tt.expected, string(result.Body))
+		})
+	}
+}
+
 func TestParseOverrideOperations(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		ops, err := objects.ParseOverrideOperations("")
@@ -2214,6 +2345,122 @@ func TestOverrideOperationsArrayOps(t *testing.T) {
 
 		return string(result.Body)
 	}
+
+	t.Run("delete removes a field from every array item", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"input[*].internal_chat_message_metadata_passthrough"}]`
+		body := `{"input":[{"role":"user","content":"hello","internal_chat_message_metadata_passthrough":{"id":1}},{"role":"assistant","content":"hi","internal_chat_message_metadata_passthrough":null},{"role":"user","content":"next"}],"model":"test"}`
+
+		got := runMiddleware(t, ops, body)
+
+		require.JSONEq(t, `{"input":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}],"model":"test"}`, got)
+	})
+
+	t.Run("delete traverses nested arrays and preserves other values", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"messages[*].content[*].cache_control"}]`
+		body := `{"messages":[{"content":[{"text":"hello","cache_control":{"type":"ephemeral"}},{"text":"next","id":9007199254740993}]},{"content":"plain text"},{"content":[null,{"text":"last","cache_control":false}]}]}`
+
+		got := runMiddleware(t, ops, body)
+
+		require.JSONEq(t, `{"messages":[{"content":[{"text":"hello"},{"text":"next","id":9007199254740993}]},{"content":"plain text"},{"content":[null,{"text":"last"}]}]}`, got)
+		require.Equal(t, "9007199254740993", gjson.Get(got, "messages.0.content.1.id").Raw)
+	})
+
+	t.Run("delete wildcard leaves missing and non-array paths unchanged", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"input[*].metadata"}]`
+		for _, body := range []string{`{}`, `{"input":[]}`, `{"input":null}`, `{"input":{"metadata":"keep"}}`, `{"input":[null,7,"text",{}]}`} {
+			require.JSONEq(t, body, runMiddleware(t, ops, body))
+		}
+	})
+
+	t.Run("delete wildcard respects escaped path characters", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"message\\.list[*].meta\\.data"}]`
+		body := `{"message.list":[{"meta.data":"remove","keep":true}],"message":{"list":[{"meta.data":"keep"}]}}`
+
+		got := runMiddleware(t, ops, body)
+
+		require.JSONEq(t, `{"message.list":[{"keep":true}],"message":{"list":[{"meta.data":"keep"}]}}`, got)
+	})
+
+	t.Run("delete preserves exact indexes and escaped literal wildcards", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"input.1.metadata"},{"op":"delete","path":"literal\\[\\*\\].metadata"}]`
+		body := `{"input":[{"metadata":"keep"},{"metadata":"remove","keep":true}],"literal[*]":{"metadata":"remove","keep":false}}`
+
+		got := runMiddleware(t, ops, body)
+
+		require.JSONEq(t, `{"input":[{"metadata":"keep"},{"keep":true}],"literal[*]":{"keep":false}}`, got)
+	})
+
+	t.Run("delete wildcard removes all selected array elements", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"input[*]"}]`
+		got := runMiddleware(t, ops, `{"input":[1,2,3],"keep":true}`)
+
+		require.JSONEq(t, `{"input":[],"keep":true}`, got)
+	})
+
+	t.Run("delete wildcard preserves relative paths while rebuilding arrays", func(t *testing.T) {
+		for _, tt := range []struct {
+			name string
+			path string
+			body string
+			want string
+		}{
+			{
+				name: "root array",
+				path: "[*].metadata",
+				body: `[{"metadata":true,"keep":9007199254740993},null,7]`,
+				want: `[{"keep":9007199254740993},null,7]`,
+			},
+			{
+				name: "adjacent wildcards",
+				path: "input[*][*].metadata",
+				body: `{"input":[[{"metadata":true,"keep":1},7],[{"metadata":null}],null]}`,
+				want: `{"input":[[{"keep":1},7],[{}],null]}`,
+			},
+			{
+				name: "remove nested items",
+				path: "input[*][*]",
+				body: `{"input":[[1,2],[3],null]}`,
+				want: `{"input":[[],[],null]}`,
+			},
+			{
+				name: "wildcard in an empty object key",
+				path: "input[*].[*]",
+				body: `{"input":[{"":[1,2],"keep":true}]}`,
+				want: `{"input":[{"":[],"keep":true}]}`,
+			},
+			{
+				name: "field wildcard in an empty object key",
+				path: "input[*].[*].metadata",
+				body: `{"input":[{"":[{"metadata":true,"keep":1}]}]}`,
+				want: `{"input":[{"":[{"keep":1}]}]}`,
+			},
+			{
+				name: "empty key wildcard does not select the array item itself",
+				path: "input[*].[*]",
+				body: `{"input":[[1,2],null]}`,
+				want: `{"input":[[1,2],null]}`,
+			},
+			{
+				name: "empty object key",
+				path: "input[*].",
+				body: `{"input":[{"":true,"keep":1},null,{"":2}]}`,
+				want: `{"input":[{"keep":1},null,{}]}`,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				ops, err := json.Marshal([]objects.OverrideOperation{{Op: objects.OverrideOpDelete, Path: tt.path}})
+				require.NoError(t, err)
+				got := runMiddleware(t, string(ops), tt.body)
+				require.Equal(t, tt.want, got)
+			})
+		}
+	})
+
+	t.Run("delete wildcard without matches preserves the original bytes", func(t *testing.T) {
+		ops := `[{"op":"delete","path":"input[*].metadata"}]`
+		body := `{ "input": [ { "keep": 1e+09 }, null, 7 ], "id": 9007199254740993 }`
+		require.Equal(t, body, runMiddleware(t, ops, body))
+	})
 
 	t.Run("array_append inserts a single object at the end", func(t *testing.T) {
 		ops := `[{"op":"array_append","path":"system","value":"{\"type\":\"text\",\"text\":\"injected\"}"}]`
@@ -2479,4 +2726,44 @@ func TestOverrideBodySkipsNonJSONBody(t *testing.T) {
 		require.Equal(t, "b64_json", gjson.GetBytes(modified.Body, "response_format").String())
 		require.Equal(t, "a cat", gjson.GetBytes(modified.Body, "prompt").String())
 	})
+}
+
+func TestOverrideDeleteWildcardAllocationBudget(t *testing.T) {
+	ctx := context.Background()
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			Settings: &objects.ChannelSettings{
+				OverrideParameters: `[{"op":"delete","path":"input[*].metadata"}]`,
+			},
+		},
+	}
+	outbound := &PersistentOutboundTransformer{
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       &llm.Request{Model: "test"},
+		},
+	}
+	middleware := applyOverrideRequestBody(outbound)
+	items := strings.TrimSuffix(strings.Repeat(`{"metadata":true,"keep":1},`, 128), ",")
+	body := []byte(`{"input":[` + items + `],"padding":"` + strings.Repeat("x", 256*1024) + `"}`)
+	var got []byte
+
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			request, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: body})
+			if err != nil {
+				b.Fatal(err)
+			}
+			got = request.Body
+		}
+	})
+
+	require.Equal(t, int64(128), gjson.GetBytes(got, "input.#").Int())
+	require.False(t, gjson.GetBytes(got, "input.0.metadata").Exists())
+	require.Equal(t, int64(1), gjson.GetBytes(got, "input.127.keep").Int())
+	require.Len(t, gjson.GetBytes(got, "padding").String(), 256*1024)
+	// Allow ample middleware overhead, but not a full-body copy for every item.
+	require.Less(t, result.AllocedBytesPerOp(), int64(8*len(body)))
+	t.Logf("request bytes: %d; allocated bytes/op: %d", len(body), result.AllocedBytesPerOp())
 }

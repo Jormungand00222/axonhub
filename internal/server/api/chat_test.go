@@ -26,10 +26,33 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer/openai/codex"
 )
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+func TestPrimeCodexTurnStateHeader(t *testing.T) {
+	first := &httpclient.StreamEvent{
+		Type: "response.created",
+		Data: []byte(`{"type":"response.created"}`),
+		Headers: http.Header{
+			codex.TurnStateHeader: []string{"ts-1"},
+		},
+	}
+	second := &httpclient.StreamEvent{Type: "response.completed", Data: []byte(`{"type":"response.completed"}`)}
+	downstreamHeaders := make(http.Header)
+
+	stream := primeCodexTurnStateHeader(downstreamHeaders, streams.SliceStream([]*httpclient.StreamEvent{first, second}))
+	require.Equal(t, "ts-1", downstreamHeaders.Get(codex.TurnStateHeader))
+
+	var events []*httpclient.StreamEvent
+	for stream.Next() {
+		events = append(events, stream.Current())
+	}
+	require.NoError(t, stream.Err())
+	require.Equal(t, []*httpclient.StreamEvent{first, second}, events)
 }
 
 func setupUpstreamErrorPolicyTest(t *testing.T, policy biz.UpstreamErrorPolicy) (context.Context, *biz.SystemService) {
@@ -299,6 +322,71 @@ func TestWriteSSEStream_Success(t *testing.T) {
 	body := w.Body.String()
 	assert.Contains(t, body, `{"id":"1","choices":[{"delta":{"content":"Hi"}}]}`)
 	assert.Contains(t, body, `[DONE]`)
+}
+
+func TestWriteForwardResponseHeadersOnlyForCodexResponses(t *testing.T) {
+	result := orchestrator.ChatCompletionResult{
+		ChatCompletion: &httpclient.Response{
+			Headers: http.Header{httpclient.ReasoningIncludedHeader: []string{"true"}},
+		},
+		CodexResponseHeadersSupported: true,
+	}
+
+	tests := []struct {
+		name    string
+		request *httpclient.Request
+		want    string
+	}{
+		{
+			name:    "chat completions",
+			request: &httpclient.Request{Path: "/v1/chat/completions"},
+		},
+		{
+			name:    "responses without codex session",
+			request: &httpclient.Request{Path: "/v1/responses"},
+		},
+		{
+			name: "codex responses",
+			request: &httpclient.Request{
+				Path: "/v1/responses",
+				Headers: http.Header{
+					codex.TurnMetadataHeader: []string{`{"session_id":"session-1"}`},
+				},
+			},
+			want: "true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+
+			writeForwardResponseHeaders(c, tt.request, result)
+
+			require.Equal(t, tt.want, w.Header().Get(httpclient.ReasoningIncludedHeader))
+		})
+	}
+}
+
+func TestWriteForwardResponseHeadersRejectsUnsupportedOutbound(t *testing.T) {
+	result := orchestrator.ChatCompletionResult{
+		ChatCompletion: &httpclient.Response{
+			Headers: http.Header{httpclient.ReasoningIncludedHeader: []string{"true"}},
+		},
+	}
+	request := &httpclient.Request{
+		Path: "/v1/responses",
+		Headers: http.Header{
+			codex.TurnMetadataHeader: []string{`{"session_id":"session-1"}`},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	writeForwardResponseHeaders(c, request, result)
+
+	require.Empty(t, w.Header().Get(httpclient.ReasoningIncludedHeader))
 }
 
 func TestWriteSSEStream_WriteErrorStopsConsuming(t *testing.T) {
@@ -1012,7 +1100,7 @@ func TestWriteSSEStream_FinishReasonWithoutDoneIsNotIncomplete(t *testing.T) {
 		{Data: []byte(`{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]}`)},
 	}
 
-	WriteSSEStream(c, streams.SliceStream(events))
+	WriteSSEStream(c, &singleChoiceSSEStream{Stream: streams.SliceStream(events)})
 
 	body := w.Body.String()
 	require.NotContains(t, body, "event:error")

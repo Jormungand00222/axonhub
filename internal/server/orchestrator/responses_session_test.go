@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -237,6 +238,46 @@ func TestResponsesSessionStoreNormalizesClientProvidedHistory(t *testing.T) {
 	)
 }
 
+func TestResponsesSessionStorePreservesWebSearchCallStatusWithoutPreviousResponse(t *testing.T) {
+	store := newResponsesSessionStore()
+	ctx := shared.WithSessionScope(shared.WithResponsesAPI(context.Background()), "api-key:1")
+	body := []byte(`{"model":"gpt-5","input":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"example"}}]}`)
+
+	prepared, _ := store.prepare(ctx, body)
+	require.Equal(t, body, prepared)
+}
+
+func TestResponsesSessionStorePreservesWebSearchCallStatusInPreviousResponse(t *testing.T) {
+	store := newResponsesSessionStore()
+	ctx := shared.WithSessionScope(shared.WithResponsesAPI(context.Background()), "api-key:1")
+	store.record(ctx,
+		[]byte(`{"model":"gpt-5","input":"search docs"}`),
+		[]byte(`{"id":"resp_search","status":"completed","output":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"example"}},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":"found it"}]}`),
+	)
+
+	prepared, _ := store.prepare(ctx, []byte(`{"model":"gpt-5","previous_response_id":"resp_search","input":"continue"}`))
+	require.JSONEq(t,
+		`{"model":"gpt-5","input":[{"type":"message","role":"user","content":"search docs"},{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"example"}},{"id":"msg_1","type":"message","role":"assistant","content":"found it"},{"type":"message","role":"user","content":"continue"}]}`,
+		string(prepared),
+	)
+}
+
+func TestResponsesSessionStorePreservesWebSearchCallStatusOnMemoryMiss(t *testing.T) {
+	ctx := shared.WithSessionScope(shared.WithResponsesAPI(context.Background()), "api-key:1")
+	store := newResponsesSessionStore(func(_ context.Context, responseID string) ([]byte, []byte, bool, error) {
+		require.Equal(t, "resp_search", responseID)
+		return []byte(`{"model":"gpt-5","input":"search docs"}`),
+			[]byte(`{"id":"resp_search","status":"completed","output":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"example"}}]}`),
+			true, nil
+	})
+
+	prepared, _ := store.prepare(ctx, []byte(`{"model":"gpt-5","previous_response_id":"resp_search","input":"continue"}`))
+	require.JSONEq(t,
+		`{"model":"gpt-5","input":[{"type":"message","role":"user","content":"search docs"},{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"example"}},{"type":"message","role":"user","content":"continue"}]}`,
+		string(prepared),
+	)
+}
+
 func TestResponsesSessionStoreNormalizesClientHistoryOnCacheMiss(t *testing.T) {
 	store := newResponsesSessionStore()
 	ctx := shared.WithSessionScope(shared.WithResponsesAPI(context.Background()), "api-key:1")
@@ -358,4 +399,56 @@ func TestResponsesSessionStoreEnforcesMaximumBytes(t *testing.T) {
 
 	require.LessOrEqual(t, store.totalBytes, responsesSessionMaxBytes)
 	require.NotNil(t, store.lookup(ctx, "resp_latest"))
+}
+
+func TestResponsesSessionStoreRestoresNamespaceHistoryOnMemoryMiss(t *testing.T) {
+	ctx := shared.WithSessionScope(shared.WithResponsesAPI(t.Context()), "api-key:1")
+	loads := 0
+	store := newResponsesSessionStore(func(_ context.Context, responseID string) ([]byte, []byte, bool, error) {
+		loads++
+		require.Equal(t, "resp_namespace", responseID)
+		return []byte(`{"model":"test","input":"search docs"}`),
+			[]byte(`{"id":"resp_namespace","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"docs__search","namespace":"docs","arguments":"{}"}]}`), true, nil
+	})
+	prepared, _ := store.prepare(ctx, []byte(`{"model":"test","previous_response_id":"resp_namespace","tools":[{"type":"namespace","name":"docs","tools":[{"type":"function","name":"docs__search"}]}],"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`))
+	req, err := openairesponses.NewInboundTransformer().TransformRequest(ctx, &httpclient.Request{Body: prepared})
+	require.NoError(t, err)
+	require.Equal(t, 1, loads)
+	require.Equal(t, "docs__docs__search", req.Tools[0].Function.Name)
+	require.Equal(t, "docs", req.Tools[0].Function.Namespace)
+	calls := 0
+	for _, message := range req.Messages {
+		for _, call := range message.ToolCalls {
+			calls++
+			require.Equal(t, "docs__docs__search", call.Function.Name)
+			require.Equal(t, "docs", call.Function.Namespace)
+		}
+	}
+	require.Equal(t, 1, calls)
+	out, err := openairesponses.NewOutboundTransformer("https://example.com", "test")
+	require.NoError(t, err)
+	wire, err := out.TransformRequest(ctx, req)
+	require.NoError(t, err)
+	var body openairesponses.Request
+	require.NoError(t, json.Unmarshal(wire.Body, &body))
+	require.Equal(t, "docs__search", body.Tools[0].Tools[0].Name)
+	for _, item := range body.Input.Items {
+		if item.Type == "function_call" {
+			require.Equal(t, "docs__search", item.Name)
+			require.Equal(t, "docs", item.Namespace)
+		}
+	}
+}
+
+func TestResponsesSessionStoreWrapStreamPreservesResponseHeaders(t *testing.T) {
+	store := newResponsesSessionStore()
+	headers := http.Header{httpclient.ReasoningIncludedHeader: []string{"true"}}
+	stream := httpclient.WithResponseHeaders(
+		streams.SliceStream([]*httpclient.StreamEvent{{Data: []byte(`{"type":"response.completed"}`)}}),
+		headers,
+	)
+
+	wrapped := store.wrapStream(context.Background(), []byte(`{"model":"gpt-5"}`), stream)
+
+	require.Equal(t, headers, httpclient.GetResponseHeaders(wrapped))
 }

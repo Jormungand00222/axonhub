@@ -189,13 +189,8 @@ func GenerateAPIKey(prefix string) (string, error) {
 // writers (there is no DB unique constraint backing the name). It MUST be called
 // inside a transaction.
 //
-// It takes a row-level lock on the parent project row (SELECT ... FOR UPDATE):
-// concurrent name operations in the same project then block until the lock
-// holder's transaction commits/rolls back, so the loser's check observes the
-// committed row and is rejected. Because the lock is on a per-project row, name
-// operations in different projects do not contend. This is portable across the
-// multi-writer server dialects (PostgreSQL, MySQL, TiDB). SQLite serializes
-// writers itself and rejects SELECT ... FOR UPDATE, so the lock is a no-op there.
+// Concurrent name operations in one project are serialized, including operations
+// by the same creator. SQLite serializes writers itself, so the lock is a no-op.
 //
 // The project row is read with a system bypass because some write callers (e.g.
 // the OpenAPI service-account principal) may lack project read scope, and it runs
@@ -249,11 +244,8 @@ func (s *APIKeyService) CreateLLMAPIKey(ctx context.Context, owner *ent.APIKey, 
 			return err
 		}
 
-		// Names identify keys on the OpenAPI surface (GetForRead resolves a name
-		// within the owner's project), so per-project name uniqueness must hold. The
-		// privacy mutation policy vets the caller during Save, so an unauthorized
-		// caller is denied before the post-insert check below and cannot use
-		// duplicate-name errors to probe which names exist.
+		// The privacy mutation policy vets the caller during Save, before the
+		// duplicate-name check, so unauthorized callers cannot probe existing names.
 		created, err := client.APIKey.Create().
 			SetName(name).
 			SetKey(generatedKey).
@@ -269,25 +261,13 @@ func (s *APIKeyService) CreateLLMAPIKey(ctx context.Context, owner *ent.APIKey, 
 			return fmt.Errorf("failed to create api key: %w", err)
 		}
 
-		// API key names are unique per project at the application level — there is
-		// no DB unique constraint. After the authorized insert, verify no other live
-		// key in this project shares the name; checking AFTER Save preserves the
-		// privacy-denial ordering (the mutation policy already vetted the caller, so
-		// an unauthorized caller is denied before reaching this check and cannot
-		// probe which names exist). The count is privacy-bypassed because the OpenAPI
-		// service-account principal may lack read scope, and is live-only (the
-		// soft-delete interceptor filters deleted_at) so names stay reusable after a
-		// soft delete. With the project row lock above held, a concurrent same-name
-		// create cannot interleave: it blocks until this transaction commits and then
-		// observes this row, so the check is race-safe on multi-writer backends too.
-		bypassCtx := authz.WithSystemBypass(ctx, "api key name uniqueness")
-
-		dupCount, err := client.APIKey.Query().
-			Where(
-				apikey.NameEQ(name),
-				apikey.ProjectIDEQ(owner.ProjectID),
-			).
-			Count(bypassCtx)
+		// Service-account callers cannot read personal keys, so duplicate
+		// responses must only depend on non-personal keys in their project.
+		dupCount, err := client.APIKey.Query().Where(
+			apikey.NameEQ(name),
+			apikey.ProjectIDEQ(owner.ProjectID),
+			apikey.TypeNEQ(apikey.TypePersonal),
+		).Count(authz.WithSystemBypass(ctx, "api key name uniqueness"))
 		if err != nil {
 			return fmt.Errorf("failed to check api key name uniqueness: %w", err)
 		}
@@ -328,6 +308,15 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 		}
 	}
 
+	// Service-account keys carry caller-supplied scopes. API key scopes are
+	// enforced without a project dimension, so the caller must be able to grant
+	// every requested scope at the level it is declared for.
+	if apiKeyType == apikey.TypeServiceAccount {
+		if err := s.requireServiceAccountScopeGrant(ctx, user.ID, input.ProjectID, input.Scopes); err != nil {
+			return nil, err
+		}
+	}
+
 	// Generate API key with configured prefix
 	generatedKey, err := GenerateAPIKey(s.keyPrefix)
 	if err != nil {
@@ -339,28 +328,8 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 	err = s.RunInTransaction(ctx, func(ctx context.Context) error {
 		client := s.entFromContext(ctx)
 
-		// API key names are unique per project at the application level (there is no
-		// DB unique constraint). The project row lock serializes same-project name
-		// operations so the live-only check (the soft-delete interceptor filters
-		// deleted_at, so a name is reusable after a soft delete) and the insert are
-		// atomic across concurrent writers (PostgreSQL, MySQL, TiDB); no-op on the
-		// single-writer SQLite default.
 		if err := s.lockProjectForAPIKeyName(ctx, input.ProjectID); err != nil {
 			return err
-		}
-
-		exists, err := client.APIKey.Query().
-			Where(
-				apikey.NameEQ(input.Name),
-				apikey.ProjectIDEQ(input.ProjectID),
-			).
-			Exist(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to check API key name uniqueness: %w", err)
-		}
-
-		if exists {
-			return xerrors.DuplicateNameError("API Key", input.Name)
 		}
 
 		create := client.APIKey.Create().
@@ -395,6 +364,20 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 			return fmt.Errorf("failed to create API key: %w", err)
 		}
 
+		// Save runs the mutation policy before the bypassed uniqueness query;
+		// returning an error rolls the insert back with this transaction.
+		dupCount, err := client.APIKey.Query().Where(
+			apikey.NameEQ(input.Name),
+			apikey.ProjectIDEQ(input.ProjectID),
+			apikey.Or(apikey.TypeNEQ(apikey.TypePersonal), apikey.UserIDEQ(user.ID)),
+		).Count(authz.WithSystemBypass(ctx, "api key name uniqueness"))
+		if err != nil {
+			return fmt.Errorf("failed to check API key name uniqueness: %w", err)
+		}
+		if dupCount > 1 {
+			return xerrors.DuplicateNameError("API Key", input.Name)
+		}
+
 		apiKey = created
 
 		return nil
@@ -406,14 +389,22 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 	return apiKey, nil
 }
 
-func (s *APIKeyService) requireProjectAdmin(ctx context.Context, userID, projectID int) error {
-	currentUser, err := authz.RunWithSystemBypass(ctx, "api-key-project-permission", func(bypassCtx context.Context) (*ent.User, error) {
+// loadUserPermissions reloads the user together with the edges the permission
+// validator needs. The JWT middleware already loads them, but the API key
+// services are also reachable from tests and internal callers, so reload under
+// a system bypass instead of relying on the shape of the context user.
+func (s *APIKeyService) loadUserPermissions(ctx context.Context, userID int) (*ent.User, error) {
+	return authz.RunWithSystemBypass(ctx, "api-key-scope-permission", func(bypassCtx context.Context) (*ent.User, error) {
 		return s.entFromContext(bypassCtx).User.Query().
 			Where(user.IDEQ(userID)).
 			WithRoles().
 			WithProjectUsers().
 			Only(bypassCtx)
 	})
+}
+
+func (s *APIKeyService) requireProjectAdmin(ctx context.Context, userID, projectID int) error {
+	currentUser, err := s.loadUserPermissions(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to load API key creator permissions: %w", err)
 	}
@@ -427,6 +418,54 @@ func (s *APIKeyService) requireProjectAdmin(ctx context.Context, userID, project
 	}
 
 	return nil
+}
+
+// requireServiceAccountScopeGrant rejects service-account scope grants the
+// caller could not make themselves. It is the API-key counterpart of the guard
+// role and project-membership writes already use.
+func (s *APIKeyService) requireServiceAccountScopeGrant(ctx context.Context, userID, projectID int, scopesToGrant []string) error {
+	if len(scopesToGrant) == 0 {
+		return nil
+	}
+
+	currentUser, err := s.loadUserPermissions(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to load API key creator permissions: %w", err)
+	}
+
+	if err := NewPermissionValidator().CanGrantAPIKeyScopes(ctx, currentUser, scopesToGrant, projectID); err != nil {
+		return fmt.Errorf("insufficient permissions to grant the requested API key scopes: %w", err)
+	}
+
+	return nil
+}
+
+// resultingServiceAccountScopes returns the scope set a service-account update
+// would leave on the key, mirroring the SetScopes/AppendScopes/ClearScopes
+// handling below. The boolean reports whether the update grants scopes at all;
+// clearing scopes never needs a grant check.
+func resultingServiceAccountScopes(apiKey *ent.APIKey, input ent.UpdateAPIKeyInput) ([]string, bool) {
+	// ClearScopes is applied last below, so an update that clears never grants
+	// anything even when scopes are also supplied.
+	if input.ClearScopes {
+		return nil, false
+	}
+
+	switch {
+	case len(input.Scopes) > 0:
+		// Ent applies SetScopes and AppendScopes in the same UPDATE, and the
+		// persisted result depends on the dialect (the append may be evaluated
+		// against the existing value, dropping the replacement). Validate every
+		// scope that could survive instead of only the replacement.
+		merged := append(append([]string{}, apiKey.Scopes...), input.Scopes...)
+		merged = append(merged, input.AppendScopes...)
+
+		return lo.Uniq(merged), true
+	case len(input.AppendScopes) > 0:
+		return lo.Uniq(append(append([]string{}, apiKey.Scopes...), input.AppendScopes...)), true
+	default:
+		return nil, false
+	}
 }
 
 // UpdateAPIKey updates an existing API key.
@@ -451,38 +490,33 @@ func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id int, input ent.Upda
 			return fmt.Errorf("noauth type API key cannot be updated")
 		}
 
+		if apiKey.Type == apikey.TypeServiceAccount {
+			user, ok := contexts.GetUser(ctx)
+			if !ok {
+				return fmt.Errorf("user not found in context")
+			}
+
+			resultingScopes, changed := resultingServiceAccountScopes(apiKey, input)
+			if changed {
+				if err := s.requireServiceAccountScopeGrant(ctx, user.ID, apiKey.ProjectID, resultingScopes); err != nil {
+					return err
+				}
+			}
+		}
+
 		if apiKey.Type == apikey.TypePersonal {
 			user, ok := contexts.GetUser(ctx)
 			if !ok {
 				return fmt.Errorf("user not found in context")
 			}
-			if apiKey.UserID != user.ID {
-				return fmt.Errorf("personal API key can only be modified by its creator")
+			if apiKey.UserID != user.ID && !user.IsOwner {
+				return fmt.Errorf("personal API key can only be modified by its creator or a system owner")
 			}
 		}
 
-		// Renaming: serialize same-project name operations and reject a duplicate
-		// live name (no DB unique constraint backs the name). The project row lock
-		// makes the check-then-update atomic across concurrent writers (PostgreSQL,
-		// MySQL, TiDB); no-op on the single-writer SQLite default.
 		if input.Name != nil && *input.Name != apiKey.Name {
 			if err := s.lockProjectForAPIKeyName(ctx, apiKey.ProjectID); err != nil {
 				return err
-			}
-
-			exists, err := client.APIKey.Query().
-				Where(
-					apikey.NameEQ(*input.Name),
-					apikey.ProjectIDEQ(apiKey.ProjectID),
-					apikey.IDNEQ(id),
-				).
-				Exist(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to check API key name uniqueness: %w", err)
-			}
-
-			if exists {
-				return xerrors.DuplicateNameError("API Key", *input.Name)
 			}
 		}
 
@@ -525,6 +559,26 @@ func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id int, input ent.Upda
 			return fmt.Errorf("failed to update API key: %w", err)
 		}
 
+		if input.Name != nil && *input.Name != apiKey.Name {
+			nameScope := apikey.TypeNEQ(apikey.TypePersonal)
+			if apiKey.Type == apikey.TypePersonal {
+				nameScope = apikey.Or(nameScope, apikey.UserIDEQ(apiKey.UserID))
+			} else if user, ok := contexts.GetUser(ctx); ok {
+				nameScope = apikey.Or(nameScope, apikey.UserIDEQ(user.ID))
+			}
+			duplicateCount, err := client.APIKey.Query().Where(
+				apikey.NameEQ(*input.Name),
+				apikey.ProjectIDEQ(apiKey.ProjectID),
+				nameScope,
+			).Count(authz.WithSystemBypass(ctx, "api key name uniqueness"))
+			if err != nil {
+				return fmt.Errorf("failed to check api key name uniqueness: %w", err)
+			}
+			if duplicateCount > 1 {
+				return xerrors.DuplicateNameError("API Key", *input.Name)
+			}
+		}
+
 		result = updated
 
 		return nil
@@ -556,8 +610,8 @@ func (s *APIKeyService) UpdateAPIKeyStatus(ctx context.Context, id int, status a
 		if !ok {
 			return nil, fmt.Errorf("user not found in context")
 		}
-		if existing.UserID != user.ID {
-			return nil, fmt.Errorf("personal API key can only be modified by its creator")
+		if existing.UserID != user.ID && !user.IsOwner {
+			return nil, fmt.Errorf("personal API key can only be modified by its creator or a system owner")
 		}
 	}
 
@@ -661,8 +715,8 @@ func (s *APIKeyService) UpdateAPIKeyProfiles(ctx context.Context, id int, profil
 		if !ok {
 			return nil, fmt.Errorf("user not found in context")
 		}
-		if existing.UserID != user.ID {
-			return nil, fmt.Errorf("personal API key can only be modified by its creator")
+		if existing.UserID != user.ID && !user.IsOwner {
+			return nil, fmt.Errorf("personal API key can only be modified by its creator or a system owner")
 		}
 	}
 
@@ -1000,9 +1054,8 @@ func (s *APIKeyService) GetAPIKey(ctx context.Context, key string) (*ent.APIKey,
 // key. This is the read-side counterpart to the implicit ent gating used by the
 // update mutations.
 //
-// Name lookups rely on the same project boundary: names are unique within a
-// project (enforced on create/update), so once the privacy filter narrows the
-// query to the caller's project, a name identifies at most one key.
+// Multiple creators can use the same name in a project. Callers who can see
+// those keys must use an ID or key when the name is ambiguous.
 func (s *APIKeyService) GetForRead(ctx context.Context, id *int, key *string, name *string) (*ent.APIKey, error) {
 	if lo.Count([]bool{id != nil, key != nil, name != nil}, true) != 1 {
 		return nil, fmt.Errorf("exactly one of api key id, key, or name must be provided")
@@ -1022,10 +1075,8 @@ func (s *APIKeyService) GetForRead(ctx context.Context, id *int, key *string, na
 
 	apiKey, err := q.Only(ctx)
 	if err != nil {
-		// Names are unique per project only at the application level (no DB
-		// constraint), so a database that predates that enforcement may hold
-		// duplicate live names. A name then no longer identifies a single key —
-		// surface an actionable error instead of ent's opaque "not singular".
+		// Multiple visible keys may share a name. Return an actionable error
+		// rather than ent's opaque "not singular" error.
 		if name != nil && ent.IsNotSingular(err) {
 			return nil, fmt.Errorf("multiple API keys are named %q in this project; use id or key to identify the key", *name)
 		}
@@ -1077,7 +1128,7 @@ func (s *APIKeyService) bulkUpdateAPIKeyStatus(ctx context.Context, ids []int, s
 		return fmt.Errorf("noauth type API key cannot be bulk %sd", action)
 	}
 
-	// Personal API keys can only be managed by their creator
+	// Personal API keys can only be managed by their creator or a system owner
 	personalKeys, err := client.APIKey.Query().
 		Where(apikey.IDIn(ids...), apikey.TypeEQ(apikey.TypePersonal)).
 		All(ctx)
@@ -1091,8 +1142,8 @@ func (s *APIKeyService) bulkUpdateAPIKeyStatus(ctx context.Context, ids []int, s
 			return fmt.Errorf("user not found in context")
 		}
 		for _, k := range personalKeys {
-			if k.UserID != user.ID {
-				return fmt.Errorf("personal API key %q can only be %sd by its creator", k.Name, action)
+			if k.UserID != user.ID && !user.IsOwner {
+				return fmt.Errorf("personal API key %q can only be %sd by its creator or a system owner", k.Name, action)
 			}
 		}
 	}
@@ -1145,13 +1196,26 @@ func (s *APIKeyService) RotateAPIKey(ctx context.Context, id int) (*ent.APIKey, 
 		return nil, fmt.Errorf("noauth type API key cannot be rotated")
 	}
 
+	// Rotating hands the caller a usable copy of the key, so the caller must be
+	// able to grant the scopes the key already carries.
+	if existing.Type == apikey.TypeServiceAccount {
+		user, ok := contexts.GetUser(ctx)
+		if !ok {
+			return nil, fmt.Errorf("user not found in context")
+		}
+
+		if err := s.requireServiceAccountScopeGrant(ctx, user.ID, existing.ProjectID, existing.Scopes); err != nil {
+			return nil, err
+		}
+	}
+
 	if existing.Type == apikey.TypePersonal {
 		user, ok := contexts.GetUser(ctx)
 		if !ok {
 			return nil, fmt.Errorf("user not found in context")
 		}
-		if existing.UserID != user.ID {
-			return nil, fmt.Errorf("personal API key can only be rotated by its creator")
+		if existing.UserID != user.ID && !user.IsOwner {
+			return nil, fmt.Errorf("personal API key can only be rotated by its creator or a system owner")
 		}
 	}
 
@@ -1210,7 +1274,13 @@ func (s *APIKeyService) EnsureNoAuthAPIKey(ctx context.Context) (*ent.APIKey, er
 		SetScopes([]string{string(scopes.ScopeWriteRequests), string(scopes.ScopeReadChannels)}).
 		Save(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create noauth api key: %w", err)
+		if !ent.IsConstraintError(err) {
+			return nil, fmt.Errorf("failed to create noauth api key: %w", err)
+		}
+		apiKey, err = client.APIKey.Query().Where(apikey.KeyEQ(NoAuthAPIKeyValue)).Only(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create noauth api key: %w", err)
+		}
 	}
 
 	// DO NOT CACHE PROJECT

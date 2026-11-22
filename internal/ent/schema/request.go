@@ -28,6 +28,8 @@ func (Request) Indexes() []ent.Index {
 			StorageKey("requests_by_api_key_id_created_at"),
 		index.Fields("project_id", "created_at").
 			StorageKey("requests_by_project_id_created_at"),
+		index.Fields("project_id", "user_id", "created_at").
+			StorageKey("requests_by_project_id_user_id_created_at"),
 		index.Fields("channel_id", "created_at").
 			StorageKey("requests_by_channel_id_created_at"),
 		index.Fields("trace_id", "created_at").
@@ -46,6 +48,17 @@ func (Request) Fields() []ent.Field {
 			Optional().
 			Immutable().
 			Comment("API Key ID of the request, null for the request from the Admin."),
+		field.Int("user_id").
+			Optional().
+			Nillable().
+			Immutable().
+			Annotations(entgql.Skip(
+				entgql.SkipType,
+				entgql.SkipWhereInput,
+				entgql.SkipMutationCreateInput,
+				entgql.SkipMutationUpdateInput,
+			)).
+			Comment("User ID of the Playground request creator"),
 		field.Int("project_id").
 			Immutable().
 			Default(1).
@@ -78,6 +91,9 @@ func (Request) Fields() []ent.Field {
 				entgql.Directives(forceResolver()),
 			),
 		// The final response to the user.
+		field.JSON("response_headers", objects.JSONRawMessage{}).
+			Optional().
+			Comment("Response headers sent to the client, with sensitive values masked"),
 		// e.g: the provider response with Claude format, but the user expects the response with OpenAI format, the response_body is the OpenAI response format.
 		field.JSON("response_body", objects.JSONRawMessage{}).Optional().Annotations(
 			entgql.Directives(forceResolver()),
@@ -96,6 +112,8 @@ func (Request) Fields() []ent.Field {
 		// Whether the request is a streaming request
 		field.Bool("stream").Default(false).Immutable(),
 		field.String("client_ip").Default("").Immutable(),
+		// User-Agent header of the client that initiated the request.
+		field.String("user_agent").Default("").Immutable(),
 		// Total latency in milliseconds from request start to completion
 		field.Int64("metrics_latency_ms").Optional().Nillable(),
 		// First token latency in milliseconds (only for streaming requests)
@@ -176,13 +194,15 @@ func (Request) Annotations() []schema.Annotation {
 func (Request) Policy() ent.Policy {
 	return scopes.Policy{
 		Query: scopes.QueryPolicy{
-			scopes.APIKeyScopeQueryRule(scopes.ScopeWriteRequests),
+			// API key principals stay inside the key's project: a project-level
+			// write_requests grant must not become a system-wide read.
+			scopes.APIKeyProjectScopeReadRule(scopes.ScopeWriteRequests),
 			scopes.UserProjectScopeReadRequestsRule(scopes.ScopeReadRequests),
 			scopes.OwnerRule(),
 			scopes.UserReadScopeRule(scopes.ScopeReadRequests),
 		},
 		Mutation: scopes.MutationPolicy{
-			scopes.APIKeyScopeMutationRule(scopes.ScopeWriteRequests),
+			scopes.APIKeyProjectScopeWriteRule(scopes.ScopeWriteRequests),
 			scopes.UserProjectScopeWriteRule(scopes.ScopeWriteRequests),
 			scopes.OwnerRule(),
 			scopes.UserWriteScopeRule(scopes.ScopeWriteRequests),

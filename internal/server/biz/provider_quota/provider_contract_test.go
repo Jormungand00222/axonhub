@@ -30,10 +30,10 @@ func TestQuotaCheckers_NormalizeReportedLimits(t *testing.T) {
 	// Then every provider-reported model limit is available in normalized data.
 	require.NoError(t, err)
 	require.Len(t, quota.Limits, 2)
-	require.Equal(t, "claude-sonnet", quota.Limits[0].Window)
-	require.Equal(t, "gemini-3-pro", quota.Limits[1].Window)
-	require.InDelta(t, 0.9, quota.Limits[0].UsageRatio, 1e-9)
-	require.InDelta(t, 0.25, quota.Limits[1].UsageRatio, 1e-9)
+	require.Equal(t, "gemini_5h", quota.Limits[0].Window)
+	require.Equal(t, "claude_gpt_5h", quota.Limits[1].Window)
+	require.InDelta(t, 0.25, quota.Limits[0].UsageRatio, 1e-9)
+	require.InDelta(t, 0.9, quota.Limits[1].UsageRatio, 1e-9)
 	assertNormalizedLimitContract(t, quota)
 }
 
@@ -128,7 +128,6 @@ func TestQuotaCheckerCoverageMatrix(t *testing.T) {
 		"nanogpt":          NewNanoGPTQuotaChecker(client),
 		"zenmux":           NewZenmuxQuotaChecker(client),
 		"cline":            NewClineQuotaChecker(client),
-		"wafer":            NewWaferQuotaChecker(client),
 		"synthetic":        NewSyntheticQuotaChecker(client),
 		"neuralwatt":       NewNeuralWattQuotaChecker(client),
 		"apertis":          NewApertisQuotaChecker(client),
@@ -161,10 +160,8 @@ func TestQuotaCheckerCoverageMatrix(t *testing.T) {
 		{"zenmux", channel.TypeZenmuxGemini, "", "zenmux_windows", 2},
 		{"zenmux", channel.TypeZenmuxVideo, "", "zenmux_windows", 2},
 		{"cline", channel.TypeCline, "", "cline_windows", 3},
-		{"wafer", channel.TypeOpenai, "https://pass.wafer.ai", "wafer_cycle", 1},
-		{"wafer", channel.TypeOpenaiResponses, "https://pass.wafer.ai", "wafer_cycle", 1},
-		{"synthetic", channel.TypeOpenai, "https://api.synthetic.new", "synthetic_windows", 2},
-		{"synthetic", channel.TypeOpenaiResponses, "https://api.synthetic.new", "synthetic_windows", 2},
+		{"synthetic", channel.TypeOpenai, "https://api.synthetic.new", "synthetic_windows", 3},
+		{"synthetic", channel.TypeOpenaiResponses, "https://api.synthetic.new", "synthetic_windows", 3},
 		{"neuralwatt", channel.TypeOpenai, "https://api.neuralwatt.com", "neuralwatt_kwh", 1},
 		{"neuralwatt", channel.TypeOpenaiResponses, "https://api.neuralwatt.com", "neuralwatt_kwh", 1},
 		{"apertis", channel.TypeOpenai, "https://api.apertis.ai", "apertis_limits", 1},

@@ -20,10 +20,13 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 	}
 
 	var (
-		messageStart  *StreamEvent
-		contentBlocks []MessageContentBlock
-		usage         *Usage
-		stopReason    *string
+		messageStart      *StreamEvent
+		contentBlocks     []MessageContentBlock
+		usage             *Usage
+		stopReason        *string
+		messageDeltaUsage bool
+		streamError       bool
+		usageEvidence     = llm.AccountingEvidenceUnavailable
 	)
 
 	for _, chunk := range chunks {
@@ -38,9 +41,11 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 
 		switch event.Type {
 		case "message_start":
-			messageStart = &event
-			if event.Message != nil && event.Message.Usage != nil {
-				usage = event.Message.Usage
+			if event.Message != nil {
+				messageStart = &event
+				if event.Message.Usage != nil {
+					usage = event.Message.Usage
+				}
 			}
 		case "content_block_start":
 			if event.ContentBlock != nil {
@@ -139,6 +144,7 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			}
 
 			if event.Usage != nil {
+				messageDeltaUsage = true
 				if usage == nil {
 					usage = event.Usage
 				} else {
@@ -167,12 +173,12 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			if event.Index != nil && int(*event.Index) < len(contentBlocks) {
 				index := int(*event.Index)
 
-				block := contentBlocks[index]
+				block := &contentBlocks[index]
 				if isAnthropicToolUseLike(block.Type) {
 					if !json.Valid(block.Input) {
 						slog.WarnContext(ctx, "invalid tool use input", slog.String("input", string(block.Input)))
 
-						repaired, err := jsonrepair.JSONRepair(string(block.Input))
+						repaired, err := jsonrepair.Repair(string(block.Input))
 						if err == nil {
 							block.Input = []byte(repaired)
 						}
@@ -180,7 +186,17 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 				}
 			}
 		case "message_stop":
-			// Final event, no additional processing needed
+			if messageStart != nil && messageDeltaUsage && !streamError {
+				usageEvidence = llm.AccountingEvidenceExplicitFinal
+			}
+		case "error":
+			streamError = true
+			// An error before message_stop means the message never completed, so
+			// its usage may be partial. An error after message_stop cannot retract
+			// usage the provider already delivered with a completed message.
+			if usageEvidence != llm.AccountingEvidenceExplicitFinal {
+				usageEvidence = llm.AccountingEvidenceUnavailable
+			}
 		}
 	}
 
@@ -232,12 +248,16 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 	// Convert and return usage if available
 	if usage != nil {
 		return data, llm.ResponseMeta{
-			ID:    message.ID,
-			Usage: convertToLlmUsage(usage, platformType),
+			ID:                 message.ID,
+			Usage:              convertToLlmUsage(usage, platformType),
+			Completed:          messageStart != nil && stopReason != nil && *stopReason != "",
+			AccountingEvidence: usageEvidence,
 		}, nil
 	}
 
 	return data, llm.ResponseMeta{
-		ID: message.ID,
+		ID:                 message.ID,
+		Completed:          messageStart != nil && stopReason != nil && *stopReason != "",
+		AccountingEvidence: llm.AccountingEvidenceUnavailable,
 	}, nil
 }

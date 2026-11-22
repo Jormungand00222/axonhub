@@ -32,6 +32,7 @@ func ReadHTTPRequest(rawReq *http.Request) (*Request, error) {
 		Auth:       &AuthConfig{},
 		RequestID:  "",
 		ClientIP:   getClientIP(rawReq),
+		UserAgent:  rawReq.UserAgent(),
 		RawRequest: rawReq,
 	}
 
@@ -213,10 +214,14 @@ var blockedHeaders = map[string]bool{
 	"X-Forwarded-Server": true,
 
 	// Browser-only / hop-by-hop-ish headers that should not be forwarded to upstream.
-	"Accept-Language":    true,
-	"Dnt":                true,
-	"Origin":             true,
-	"Referer":            true,
+	"Accept-Language": true,
+	"Dnt":             true,
+	"Origin":          true,
+	"Referer":         true,
+	// NOTE: Http-Referer is deliberately NOT blocked here. It is the header
+	// OpenRouter-style channels use for app attribution, so blocking it globally
+	// would silently disable that feature. Channels that must not leak client
+	// fingerprint headers (e.g. codex) scrub it themselves.
 	"Sec-Fetch-Dest":     true,
 	"Sec-Fetch-Mode":     true,
 	"Sec-Fetch-Site":     true,
@@ -224,6 +229,12 @@ var blockedHeaders = map[string]bool{
 	"Sec-Ch-Ua":          true,
 	"Sec-Ch-Ua-Mobile":   true,
 	"Sec-Ch-Ua-Platform": true,
+
+	// User-Agent identifies the inbound client. Merging it into the outbound
+	// request would clobber a provider-required UA set by the outbound
+	// transformer (e.g. GitHubCopilotChat on Copilot channels) before any
+	// policy layer runs; explicit pass-through owns client-UA forwarding.
+	"User-Agent": true,
 
 	// AxonHub customized headers that should not be forwarded to upstream to avoid recognition.
 	// NOTE: user customized trace/thread headers will be sent to upstream.

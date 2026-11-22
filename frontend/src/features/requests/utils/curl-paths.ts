@@ -5,9 +5,11 @@ const API_FORMAT_PATHS: Record<string, string> = {
   'openai/image_generation': '/v1/images/generations',
   'openai/image_edit': '/v1/images/edits',
   'openai/image_variation': '/v1/images/variations',
+  'modelscope/image_generation': '/v1/images/generations',
   'openai/embeddings': '/v1/embeddings',
   'openai/moderations': '/v1/moderations',
   'openai/alpha_search': '/v1/alpha/search',
+  'openai/decisions': '/v1/decisions',
   'openai/video': '/v1/videos',
   'zenmux/video': '/v1/videos',
   'seedance/video': '/api/v3/contents/generations/tasks',
@@ -20,6 +22,7 @@ const API_FORMAT_PATHS: Record<string, string> = {
   'aisdk/datastream': '/api/datastream',
   'jina/rerank': '/v1/rerank',
   'jina/embeddings': '/jina/v1/embeddings',
+  'typesafe/systemone': '/v1/systemone',
 };
 
 export function getApiPath(apiFormat?: string, body?: unknown, channelType?: string): string {

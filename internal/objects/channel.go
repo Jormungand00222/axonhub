@@ -3,6 +3,8 @@ package objects
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,7 +15,8 @@ import (
 
 // ChannelEndpoint represents an outbound API endpoint configuration within a Channel.
 // Each endpoint specifies the upstream API format and an optional custom path override.
-// Within a single channel, api_format must be unique.
+// Within a single channel, api_format must be unique after legacy normalization.
+// Responses uses distinct HTTP/WS formats; Transport remains a legacy read/input field.
 type ChannelEndpoint struct {
 	APIFormat string `json:"api_format"`
 	Path      string `json:"path,omitempty"`
@@ -231,8 +234,9 @@ type ChannelSettings struct {
 	RateLimit *ChannelRateLimit `json:"rateLimit,omitempty"`
 
 	// RetryableStatusCodes configures additional HTTP status codes that should
-	// trigger retry for this channel. Default retryable codes (429 and 5xx) are
-	// always handled by the retry policy even when this list is empty.
+	// trigger retry for this channel. 5xx codes are retried by default; 429 is
+	// not, because a rate limit normally switches to another channel — listing
+	// 429 here asks for a same-channel retry instead.
 	RetryableStatusCodes []int `json:"retryableStatusCodes,omitempty"`
 
 	// RetryableErrorPatterns configures additional error text patterns that should
@@ -240,11 +244,36 @@ type ChannelSettings struct {
 	// case-sensitive substring of the error text.
 	RetryableErrorPatterns []RetryableErrorPattern `json:"retryableErrorPatterns,omitempty"`
 
+	// MaxSingleChannelRetries overrides the global "max single channel retries"
+	// for this channel. When nil, the channel inherits the global retry policy.
+	// Pointer so GQL emits null instead of 0 for channels that never set it.
+	MaxSingleChannelRetries *int `json:"maxSingleChannelRetries,omitempty"`
+
+	// ResponseTimeout overrides the global retry policy response timeouts for
+	// this channel. When nil (or mode inherit), the channel follows the global
+	// system settings. When mode is custom, the non-nil fields override the
+	// corresponding global values and a nil field still inherits.
+	ResponseTimeout *ChannelResponseTimeoutSettings `json:"responseTimeout,omitempty"`
+
 	// ModelProtocols force-specifies the outbound protocols for specific models of
 	// this channel. Each entry's apiFormats must reference api_formats the channel
 	// already has endpoints for. When set for a model, endpoint selection is
 	// restricted to those formats; otherwise all channel endpoints are eligible.
 	ModelProtocols []ModelProtocol `json:"modelProtocols,omitempty"`
+
+	// APIKeyStrategy selects how an API key is chosen when a channel has multiple
+	// enabled keys. Nil defaults to APIKeyStrategySticky (trace affinity + random
+	// fallback), preserving the historical behavior. Pointer so GQL emits null
+	// instead of a zero-value string for channels saved before the field existed.
+	APIKeyStrategy *string `json:"apiKeyStrategy,omitempty"`
+
+	// APIKeyRoundRobinSwitchAfter is the number of times a key is reused before
+	// round-robin advances to the next key. Only meaningful for the two
+	// round-robin strategies: APIKeyStrategyRoundRobin counts every request,
+	// APIKeyStrategyRoundRobinSuccess counts only successful ones. Values below 1
+	// are treated as 1 (switch immediately). Pointer so GQL emits null instead of
+	// 0 for legacy channels.
+	APIKeyRoundRobinSwitchAfter *int `json:"apiKeyRoundRobinSwitchAfter,omitempty"`
 
 	// ProviderQuota holds provider-specific quota collection credentials and
 	// options. Fields are sensitive (e.g. auth cookies) and only exposed to
@@ -252,6 +281,47 @@ type ChannelSettings struct {
 	ProviderQuota *ChannelProviderQuotaSettings `json:"providerQuota,omitempty"`
 
 	QuotaRoutingMode QuotaRoutingMode `json:"quotaRoutingMode,omitempty"`
+}
+
+// API key selection strategies for channels with multiple enabled keys.
+const (
+	// APIKeyStrategySticky keeps the same key for a given trace and picks randomly
+	// when there is no trace. This is the default / historical behavior.
+	APIKeyStrategySticky = "sticky"
+	// APIKeyStrategyRandom picks a key at random regardless of trace.
+	APIKeyStrategyRandom = "random"
+	// APIKeyStrategyRoundRobin advances through keys in order, reusing each key for
+	// APIKeyRoundRobinSwitchAfter consecutive requests before moving on. Every
+	// request counts, whatever its outcome.
+	APIKeyStrategyRoundRobin = "round_robin"
+	// APIKeyStrategyRoundRobinSuccess is round-robin that only counts successful
+	// calls: each key is reused until it has served APIKeyRoundRobinSwitchAfter
+	// successful requests, then the cursor moves on to the next key. Failed and
+	// canceled requests do not advance it.
+	//
+	//nolint:gosec // G101 - a strategy identifier, not a credential.
+	APIKeyStrategyRoundRobinSuccess = "round_robin_success"
+	// APIKeyStrategyPriority always uses the first selectable key. This is the
+	// historical "fixed" behavior under a new name: every call re-reads the first
+	// key, so a disabled leading key hands over to the next one immediately.
+	APIKeyStrategyPriority = "priority"
+	// APIKeyStrategyFixed remembers the key currently in use and keeps using it
+	// until that key stops being selectable (disabled or removed from the
+	// channel). It then walks the full key array forward from the remembered
+	// position, skipping disabled keys and wrapping around at the end.
+	APIKeyStrategyFixed = "fixed"
+)
+
+// IsValidAPIKeyStrategy reports whether value is a known strategy (empty is valid
+// and means the default sticky behavior).
+func IsValidAPIKeyStrategy(value string) bool {
+	switch value {
+	case "", APIKeyStrategySticky, APIKeyStrategyRandom, APIKeyStrategyRoundRobin,
+		APIKeyStrategyRoundRobinSuccess, APIKeyStrategyPriority, APIKeyStrategyFixed:
+		return true
+	default:
+		return false
+	}
 }
 
 // ChannelProviderQuotaSettings groups per-provider quota collection settings.
@@ -263,10 +333,12 @@ type ChannelProviderQuotaSettings struct {
 	Ollama *OllamaQuotaSettings `json:"ollama,omitempty"`
 }
 
-// CommandCodeQuotaSettings holds the credentials used to query the Command Code
-// account quota. AuthCookie is the commandcode.ai session cookie (a
-// "__Secure-commandcode_prod_.session_token" style value) sent to the internal
-// billing endpoints.
+// CommandCodeQuotaSettings holds the fallback credential used to query the
+// Command Code account quota. Quota is normally read with the channel API key
+// (the /alpha/billing/* endpoints, the same key the official CLI uses);
+// AuthCookie is only used when that key cannot reach the billing API, and is
+// the commandcode.ai session cookie (a "__Secure-commandcode_prod_.session_token"
+// style value) sent to the Studio-wide internal billing endpoints.
 type CommandCodeQuotaSettings struct {
 	AuthCookie string `json:"authCookie,omitempty"`
 }
@@ -297,6 +369,78 @@ func (s OllamaQuotaSettings) String() string {
 type RetryableErrorPattern struct {
 	Pattern string `json:"pattern"`
 	Regex   bool   `json:"regex,omitempty"`
+}
+
+// ChannelResponseTimeoutMode selects whether a channel follows the global retry
+// policy response timeouts or overrides them with its own values.
+type ChannelResponseTimeoutMode string
+
+const (
+	// ChannelResponseTimeoutModeInherit keeps the global retry policy timeouts.
+	// It is the zero value so channels saved before this setting existed inherit.
+	ChannelResponseTimeoutModeInherit ChannelResponseTimeoutMode = ""
+
+	// ChannelResponseTimeoutModeCustom overrides the global timeouts with the
+	// values configured on the channel.
+	ChannelResponseTimeoutModeCustom ChannelResponseTimeoutMode = "custom"
+)
+
+// MarshalGQL writes the GraphQL enum value. The zero value maps to INHERIT.
+func (m ChannelResponseTimeoutMode) MarshalGQL(w io.Writer) {
+	value := "INHERIT"
+	if m == ChannelResponseTimeoutModeCustom {
+		value = "CUSTOM"
+	}
+
+	_, _ = io.WriteString(w, strconv.Quote(value))
+}
+
+// UnmarshalGQL reads the GraphQL enum value. INHERIT maps to the zero value.
+// The GraphQL input declares mode as nullable, so an explicit null is accepted
+// and means INHERIT rather than being rejected.
+func (m *ChannelResponseTimeoutMode) UnmarshalGQL(v any) error {
+	if v == nil {
+		*m = ChannelResponseTimeoutModeInherit
+
+		return nil
+	}
+
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("ChannelResponseTimeoutMode must be a string")
+	}
+
+	switch str {
+	case "INHERIT":
+		*m = ChannelResponseTimeoutModeInherit
+	case "CUSTOM":
+		*m = ChannelResponseTimeoutModeCustom
+	default:
+		return fmt.Errorf("invalid ChannelResponseTimeoutMode: %s", str)
+	}
+
+	return nil
+}
+
+// ChannelResponseTimeoutSettings overrides the global retry policy response
+// timeouts for a single channel.
+type ChannelResponseTimeoutSettings struct {
+	// Mode selects whether the channel inherits the global timeouts or uses the
+	// overrides below. An empty mode is treated as inherit.
+	Mode ChannelResponseTimeoutMode `json:"mode,omitempty"`
+
+	// StreamFirstEventTimeoutSeconds overrides the timeout for the first
+	// streaming response event. nil inherits the global value; 0 disables it.
+	StreamFirstEventTimeoutSeconds *int `json:"streamFirstEventTimeoutSeconds,omitempty"`
+
+	// NonStreamResponseTimeoutSeconds overrides the timeout for non-streaming
+	// responses. nil inherits the global value; 0 disables it.
+	NonStreamResponseTimeoutSeconds *int `json:"nonStreamResponseTimeoutSeconds,omitempty"`
+}
+
+// IsCustom reports whether the channel overrides the global timeouts.
+func (s *ChannelResponseTimeoutSettings) IsCustom() bool {
+	return s != nil && s.Mode == ChannelResponseTimeoutModeCustom
 }
 
 type ChannelRateLimit struct {
@@ -344,6 +488,10 @@ type ChannelCredentials struct {
 	// When multiple keys are provided, they will be used in a round-robin fashion.
 	APIKeys []string `json:"apiKeys,omitempty"`
 
+	// VertexAPIKeys contains the project-bound credentials used by Gemini Vertex.
+	// The project and region must remain paired with the API key when keys rotate.
+	VertexAPIKeys []VertexAPIKey `json:"vertexApiKeys,omitempty"`
+
 	// ManagementAPIKey is an optional provider management/console API key used only
 	// for server-side quota checks (e.g. ZenMux). It is never attached to inference
 	// requests and never exposed to clients beyond credential write APIs.
@@ -354,6 +502,13 @@ type ChannelCredentials struct {
 
 	// GCP is the GCP credentials for the channel.
 	GCP *GCPCredential `json:"gcp,omitempty"`
+}
+
+// VertexAPIKey is a Gemini Vertex API key bound to its Google Cloud resource.
+type VertexAPIKey struct {
+	ProjectID string `json:"projectID"`
+	APIKey    string `json:"apiKey"`
+	Region    string `json:"region"`
 }
 
 // GetAllAPIKeys returns all API keys for the channel, combining APIKey and APIKeys fields.
@@ -372,6 +527,12 @@ func (c *ChannelCredentials) GetAllAPIKeys() []string {
 
 	// Add new APIKeys
 	keys = append(keys, c.APIKeys...)
+
+	for _, credential := range c.VertexAPIKeys {
+		if credential.APIKey != "" {
+			keys = append(keys, credential.APIKey)
+		}
+	}
 
 	return keys
 }
@@ -412,6 +573,20 @@ func (c *ChannelCredentials) GetEnabledCredentialRefs(disabledKeys []DisabledAPI
 // GetEnabledAPIKeys returns API keys that are not disabled.
 func (c *ChannelCredentials) GetEnabledAPIKeys(disabledKeys []DisabledAPIKey) []string {
 	return filterDisabled(c.GetAllAPIKeys(), disabledKeys)
+}
+
+func (c *ChannelCredentials) VertexAPIKey(apiKey string) (VertexAPIKey, bool) {
+	if c == nil {
+		return VertexAPIKey{}, false
+	}
+
+	for _, credential := range c.VertexAPIKeys {
+		if credential.APIKey == apiKey {
+			return credential, true
+		}
+	}
+
+	return VertexAPIKey{}, false
 }
 
 // filterDisabled drops every candidate that carries an active disable record.
@@ -508,13 +683,70 @@ const (
 	CapabilityPolicyForbid    CapabilityPolicy = "forbid"
 )
 
+type APIKeyAutoDisableMode string
+
+const (
+	APIKeyAutoDisableModeInherit APIKeyAutoDisableMode = "inherit"
+	APIKeyAutoDisableModeCustom  APIKeyAutoDisableMode = "custom"
+	APIKeyAutoDisableModeOff     APIKeyAutoDisableMode = "off"
+)
+
+// MarshalGQL writes a GraphQL enum value. The zero value is unset and must be
+// null; an empty string is not a valid APIKeyAutoDisableMode.
+func (e APIKeyAutoDisableMode) MarshalGQL(w io.Writer) {
+	if e == "" {
+		_, _ = io.WriteString(w, "null")
+		return
+	}
+	_, _ = io.WriteString(w, strconv.Quote(string(e)))
+}
+
+// UnmarshalGQL reads a GraphQL enum or null. Null stays the unset zero value.
+func (e *APIKeyAutoDisableMode) UnmarshalGQL(v any) error {
+	if v == nil {
+		*e = ""
+		return nil
+	}
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("APIKeyAutoDisableMode must be a string")
+	}
+	*e = APIKeyAutoDisableMode(str)
+	return nil
+}
+
 type ChannelPolicies struct {
 	Stream CapabilityPolicy `json:"stream,omitempty"`
 
+	// APIKeyAutoDisableMode selects how this channel combines with the global
+	// auto-disable rules: inherit (global only), custom (channel first, then
+	// global), or off (neither layer). Empty is inferred from whether rules exist.
+	APIKeyAutoDisableMode APIKeyAutoDisableMode `json:"apiKeyAutoDisableMode,omitempty"`
+
 	// APIKeyAutoDisableRules are the channel's own auto-disable rules. They are
-	// evaluated before the global retry policy and, when one matches, own the
-	// failure outright. Channels without rules fall back to the global policy.
+	// evaluated before the global retry policy when the mode is custom, and the
+	// first match owns the failure. Unmatched custom failures fall back to global.
 	APIKeyAutoDisableRules []APIKeyAutoDisableRule `json:"apiKeyAutoDisableRules,omitempty"`
+}
+
+// EffectiveAutoDisableMode returns the mode used at evaluation time.
+func (p ChannelPolicies) EffectiveAutoDisableMode() APIKeyAutoDisableMode {
+	switch p.APIKeyAutoDisableMode {
+	case APIKeyAutoDisableModeOff:
+		return APIKeyAutoDisableModeOff
+	case APIKeyAutoDisableModeCustom:
+		if len(p.APIKeyAutoDisableRules) == 0 {
+			return APIKeyAutoDisableModeInherit
+		}
+		return APIKeyAutoDisableModeCustom
+	case APIKeyAutoDisableModeInherit:
+		return APIKeyAutoDisableModeInherit
+	default:
+		if len(p.APIKeyAutoDisableRules) > 0 {
+			return APIKeyAutoDisableModeCustom
+		}
+		return APIKeyAutoDisableModeInherit
+	}
 }
 
 type APIKeyAutoDisableAction string

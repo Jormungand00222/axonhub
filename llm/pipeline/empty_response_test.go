@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -27,6 +28,15 @@ func TestHasResponseContent_ReasoningSignature(t *testing.T) {
 func TestHasResponseContent(t *testing.T) {
 	t.Run("empty response", func(t *testing.T) {
 		require.False(t, hasResponseContent(&llm.Response{}))
+	})
+
+	t.Run("decisions answers", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{
+			Decisions: &llm.DecisionsResponse{Answers: []json.RawMessage{json.RawMessage(`{"type":"refusal"}`)}},
+		}))
+		require.False(t, hasResponseContent(&llm.Response{
+			Decisions: &llm.DecisionsResponse{Answers: []json.RawMessage{}},
+		}))
 	})
 
 	t.Run("alpha search response", func(t *testing.T) {
@@ -63,6 +73,46 @@ func TestHasResponseContent(t *testing.T) {
 			Choices: []llm.Choice{{
 				Message: &llm.Message{
 					ReasoningContent: lo.ToPtr("thinking"),
+				},
+			}},
+		}))
+	})
+
+	t.Run("message audio data", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Audio: &llm.OutputAudio{ID: "audio_1", Data: "UklGRiQAAABX"},
+				},
+			}},
+		}))
+	})
+
+	t.Run("message audio transcript only", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Audio: &llm.OutputAudio{Transcript: "spoken answer"},
+				},
+			}},
+		}))
+	})
+
+	t.Run("empty message audio object", func(t *testing.T) {
+		require.False(t, hasResponseContent(&llm.Response{
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Audio: &llm.OutputAudio{},
+				},
+			}},
+		}))
+	})
+
+	t.Run("streamed delta audio", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{
+			Choices: []llm.Choice{{
+				Delta: &llm.Message{
+					Audio: &llm.OutputAudio{Data: "UklGRiQAAABX"},
 				},
 			}},
 		}))

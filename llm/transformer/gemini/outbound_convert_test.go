@@ -1018,6 +1018,35 @@ func TestConvertLLMToGeminiRequest_Tools(t *testing.T) {
 			},
 		},
 		{
+			name: "request with strict function tool",
+			input: &llm.Request{
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Test"),
+						},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type: llm.ToolTypeFunction,
+						Function: llm.Function{
+							Name:       "get_weather",
+							Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+							Strict:     lo.ToPtr(true),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.ToolConfig)
+				require.NotNil(t, result.ToolConfig.FunctionCallingConfig)
+				require.Equal(t, "VALIDATED", result.ToolConfig.FunctionCallingConfig.Mode)
+			},
+		},
+		{
 			name: "request with tool choice none",
 			input: &llm.Request{
 				Messages: []llm.Message{
@@ -2085,12 +2114,18 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 
 func TestConvertGeminiToLLMResponse_FinishReasons(t *testing.T) {
 	finishReasons := map[string]string{
-		"STOP":                    "stop",
-		"MAX_TOKENS":              "length",
-		"SAFETY":                  "content_filter",
-		"RECITATION":              "content_filter",
-		"MALFORMED_FUNCTION_CALL": "stop", // Error condition, maps to stop
-		"UNKNOWN":                 "stop",
+		"STOP":                     "stop",
+		"MAX_TOKENS":               "length",
+		"SAFETY":                   "content_filter",
+		"RECITATION":               "content_filter",
+		"BLOCKLIST":                "content_filter",
+		"PROHIBITED_CONTENT":       "content_filter",
+		"SPII":                     "content_filter",
+		"IMAGE_SAFETY":             "content_filter",
+		"IMAGE_PROHIBITED_CONTENT": "content_filter",
+		"IMAGE_RECITATION":         "content_filter",
+		"MALFORMED_FUNCTION_CALL":  "stop", // Error condition, maps to stop
+		"UNKNOWN":                  "stop",
 	}
 
 	for geminiReason, expectedLLMReason := range finishReasons {

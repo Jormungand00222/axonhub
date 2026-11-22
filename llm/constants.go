@@ -21,6 +21,11 @@ const (
 	RequestTypeModeration RequestType = "moderation"
 	// RequestTypeAlphaSearch is the Codex/CPA alpha search request type, maps to /v1/alpha/search.
 	RequestTypeAlphaSearch RequestType = "alpha_search"
+
+	// RequestTypeSystemOne represents a System One decision inference request.
+	RequestTypeSystemOne RequestType = "systemone"
+	// RequestTypeDecisions represents an OpenAI Decisions request.
+	RequestTypeDecisions RequestType = "decisions"
 )
 
 func (r RequestType) String() string {
@@ -33,9 +38,8 @@ const (
 	APIFormatOpenAIChatCompletion APIFormat = "openai/chat_completions"
 	APIFormatOpenAICompletion     APIFormat = "openai/completions"
 	APIFormatOpenAIResponse       APIFormat = "openai/responses"
-	// APIFormatOpenAIResponseWebSocket identifies a downstream Responses
-	// WebSocket request in persisted request/trace metadata. Upstream channel
-	// selection continues to use APIFormatOpenAIResponse with websocket transport.
+	// APIFormatOpenAIResponseWebSocket identifies the Responses WebSocket protocol
+	// for endpoint selection, transformation and persisted request/trace metadata.
 	APIFormatOpenAIResponseWebSocket APIFormat = "openai/responses-ws"
 	APIFormatOpenAIResponseCompact   APIFormat = "openai/responses_compact"
 	APIFormatOpenAIImageGeneration   APIFormat = "openai/image_generation"
@@ -59,9 +63,18 @@ const (
 	APIFormatJinaRerank    APIFormat = "jina/rerank"
 	APIFormatJinaEmbedding APIFormat = "jina/embeddings"
 
+	APIFormatTypeSafeSystemOne APIFormat = "typesafe/systemone"
+	APIFormatOpenAIDecisions   APIFormat = "openai/decisions"
+
 	APIFormatOllamaChat    APIFormat = "ollama/chat"
 	APIFormatSeedanceVideo APIFormat = "seedance/video"
 	APIFormatZenmuxVideo   APIFormat = "zenmux/video"
+
+	// APIFormatModelScopeImage is the ModelScope-native image protocol. ModelScope
+	// serves image generation and image editing on one async endpoint, so a single
+	// provider format covers both directions. It is a provider-only default
+	// endpoint and is intentionally absent from the configurable format list.
+	APIFormatModelScopeImage APIFormat = "modelscope/image_generation"
 )
 
 func (f APIFormat) String() string {

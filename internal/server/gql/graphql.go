@@ -18,6 +18,7 @@ import (
 	"github.com/vektah/gqlparser/v2/gqlerror"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
@@ -88,6 +89,28 @@ type GraphqlHandler struct {
 	Playground http.Handler
 }
 
+// maxBackupUploadSize bounds what the restore mutation accepts through the
+// multipart transport. gqlgen defaults MaxUploadSize to 32 MiB, but a real
+// backup exceeds that as soon as the instance has history: the request and
+// response bodies live in external storage, yet usage rows alone run to tens of
+// MiB (2026-10-05: a 108 MiB production backup was rejected with "failed to
+// parse multipart form, request body too large").
+//
+// It bounds the input, not memory safety. Restore decodes the whole backup into
+// memory-backed structures and then writes it back, and the measured peak is
+// 6-7x the file size (decoding alone is already 3-3.7x, which the upload reader
+// does not remove). 128 MiB is the size that still keeps a restore inside the
+// 1 GiB container limit docker-compose and the default Helm values ship with;
+// a cap equal to that limit would only trade the clean "request body too large"
+// error for an OOM kill. Raising it further needs a streaming Restore, not a
+// bigger constant.
+//
+// Restores that approach this cap may take longer than the default 30s
+// server.request_timeout, which /admin and therefore this endpoint run under;
+// raise AXONHUB_SERVER_REQUEST_TIMEOUT (or the config file value) before
+// uploading one.
+const maxBackupUploadSize = 128 << 20 // 128 MiB
+
 func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 	gqlSrv := handler.New(
 		NewSchema(
@@ -127,7 +150,10 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 	gqlSrv.AddTransport(transport.Options{})
 	gqlSrv.AddTransport(transport.GET{})
 	gqlSrv.AddTransport(transport.POST{})
-	gqlSrv.AddTransport(transport.MultipartForm{})
+	// The restore mutation uploads a whole backup file here; MaxMemory keeps the
+	// default so the body spools to disk instead of being held in memory by the
+	// transport.
+	gqlSrv.AddTransport(transport.MultipartForm{MaxUploadSize: maxBackupUploadSize})
 
 	gqlSrv.SetQueryCache(lru.New[*ast.QueryDocument](1024))
 
@@ -136,6 +162,7 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 		Cache: lru.New[string](1024),
 	})
 	gqlSrv.Use(&loggingTracer{})
+	gqlSrv.AroundOperations(apiKeyReadOnly)
 	skipTestChannelTransaction := entgql.SkipOperations("TestChannel", "TestChannelAPIKeys")
 	skipBulkImportTransaction := entgql.SkipIfHasFields("bulkImportChannels")
 	gqlSrv.Use(entgql.Transactioner{
@@ -180,6 +207,25 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 		Graphql:    gqlSrv,
 		Playground: playground.Handler("AxonHub", "/admin/graphql"),
 	}
+}
+
+// apiKeyReadOnly keeps service-account API keys read-only on the admin GraphQL
+// surface. Admin mutations are normally gated by ent privacy and authz scopes,
+// but several custom mutations have side effects — outbound provider requests,
+// cache and storage maintenance — without an ent mutation for the privacy layer
+// to gate, so the whole mutation class is refused for API-key principals.
+func apiKeyReadOnly(ctx context.Context, next graphql.OperationHandler) graphql.ResponseHandler {
+	principal, ok := authz.GetPrincipal(ctx)
+	if !ok || principal.Type != authz.PrincipalTypeAPIKey {
+		return next(ctx)
+	}
+
+	opCtx := graphql.GetOperationContext(ctx)
+	if opCtx == nil || opCtx.Operation == nil || opCtx.Operation.Operation == ast.Query {
+		return next(ctx)
+	}
+
+	return graphql.OneShot(graphql.ErrorResponse(ctx, "service account API keys are read-only"))
 }
 
 var guidTypeToNodeType = map[string]string{

@@ -34,6 +34,10 @@ type ChannelModelsCandidate struct {
 	modelAPIFormats    []string
 	TraceSticky        bool // selected from the last successful trace or thread channel
 	ModelRoutingPolicy *ModelRoutingPolicy
+	// DefaultMaxTokens is the AxonHub model card output limit, used as the
+	// Anthropic max_tokens fallback when the client omitted an output cap.
+	// Zero means the catalog model has no usable limit.
+	DefaultMaxTokens int64
 }
 
 // ModelRoutingPolicy contains model-level overrides carried from model
@@ -135,9 +139,9 @@ func (s *DefaultSelector) selectChannelCadidates(ctx context.Context, req *llm.R
 			continue
 		}
 
-		endpoints := applyForcedAPIFormats(ctx, ch, []biz.ChannelModelEntry{entry}, req.Model, ch.ResolveEndpoints())
+		endpoints := applyForcedAPIFormatsForRequest(ctx, ch, []biz.ChannelModelEntry{entry}, req.Model, req.RequestType, ch.ResolveEndpoints())
 		apiFormat := SelectAPIFormat(endpoints, req)
-		if req.RequestType == llm.RequestTypeAlphaSearch && apiFormat == "" {
+		if requiresExplicitEndpoint(req.RequestType) && apiFormat == "" {
 			continue
 		}
 
@@ -221,8 +225,10 @@ func (s *DefaultSelector) selectModelCandidates(ctx context.Context, req *llm.Re
 		LoadBalancerStrategy: strategy,
 		TraceStickyMode:      traceStickyMode,
 	}
+	defaultMaxTokens := modelCardOutputLimit(model)
 	for _, candidate := range candidates {
 		candidate.ModelRoutingPolicy = modelRoutingPolicy
+		candidate.DefaultMaxTokens = defaultMaxTokens
 	}
 
 	if log.DebugEnabled(ctx) {
@@ -600,6 +606,14 @@ func aggregateChannelModelCandidates(resolvedCandidates []*resolvedAssociationCa
 	return candidates
 }
 
+func modelCardOutputLimit(m *ent.Model) int64 {
+	if m == nil || m.ModelCard == nil || m.ModelCard.Limit.Output <= 0 {
+		return 0
+	}
+
+	return int64(m.ModelCard.Limit.Output)
+}
+
 // getLatestChannelUpdateTime returns the latest update time among all channels.
 func (s *DefaultSelector) getLatestChannelUpdateTime(channels []*biz.Channel) time.Time {
 	if len(channels) == 0 {
@@ -860,8 +874,8 @@ func (s *LoadBalancedSelector) pinStickyCandidate(
 
 // extractStickyCandidate returns the highest-priority candidate for channelID
 // and removes every candidate for that channel from the fallback set. This
-// prevents a failed sticky channel from being retried through another
-// association entry.
+// prevents a sticky channel from receiving another retry budget through a
+// duplicate association entry after its same-channel retries are exhausted.
 func extractStickyCandidate(
 	candidates []*ChannelModelsCandidate,
 	channelID int,
@@ -905,6 +919,9 @@ func (s *LoadBalancedSelector) sortCandidates(
 	}
 
 	if len(candidates) <= 1 {
+		if trackSelection && loadBalancer != nil && len(candidates) == 1 {
+			loadBalancer.TrackSelection(candidates[0])
+		}
 		return candidates
 	}
 
@@ -932,8 +949,6 @@ func (s *LoadBalancedSelector) sortCandidates(
 		var sortedCandidates []*ChannelModelsCandidate
 		if loadBalancer == nil {
 			sortedCandidates = group
-		} else if trackSelection {
-			sortedCandidates = loadBalancer.Sort(ctx, group, req.Model, useStream)
 		} else {
 			sortedCandidates = loadBalancer.SortWithoutTracking(ctx, group, req.Model, useStream)
 		}
@@ -950,6 +965,13 @@ func (s *LoadBalancedSelector) sortCandidates(
 			result = append(result, sortedCandidates[:remaining]...)
 			break
 		}
+	}
+
+	// Priority groups are sorted independently, but only the first candidate in
+	// the final result is selected for the initial attempt. Track it once after
+	// assembling the result so fallback groups are not counted prematurely.
+	if trackSelection && loadBalancer != nil && len(result) > 0 {
+		loadBalancer.TrackSelection(result[0])
 	}
 
 	if log.DebugEnabled(ctx) {
@@ -1029,15 +1051,21 @@ func (s *SpecifiedChannelSelector) Select(ctx context.Context, req *llm.Request)
 		return nil, fmt.Errorf("failed to get channel for test: %w", err)
 	}
 
-	entries := channel.GetDirectModelEntries()
+	entries := channel.GetModelEntries()
 
 	entry, ok := entries[req.Model]
+	if !ok {
+		entry, ok = channel.GetDirectModelEntries()[req.Model]
+	}
 	if !ok {
 		return nil, fmt.Errorf("model %s not supported in channel %s", req.Model, channel.Name)
 	}
 
-	endpoints := applyForcedAPIFormats(ctx, channel, []biz.ChannelModelEntry{entry}, req.Model, channel.ResolveEndpoints())
+	endpoints := applyForcedAPIFormatsForRequest(ctx, channel, []biz.ChannelModelEntry{entry}, req.Model, req.RequestType, channel.ResolveEndpoints())
 	apiFormat := SelectAPIFormat(endpoints, req)
+	if requiresExplicitEndpoint(req.RequestType) && apiFormat == "" {
+		return []*ChannelModelsCandidate{}, nil
+	}
 
 	candidate := &ChannelModelsCandidate{
 		Channel:   channel,

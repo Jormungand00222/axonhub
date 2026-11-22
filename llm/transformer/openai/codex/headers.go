@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
 	SessionHeader         = "Session_id"
 	SessionHeaderHyphen   = "Session-Id"
 	TurnMetadataHeader    = "X-Codex-Turn-Metadata"
+	TurnStateHeader       = "X-Codex-Turn-State"
 	WindowIDHeader        = "X-Codex-Window-Id"
 	ClientRequestIDHeader = "X-Client-Request-Id"
 	BetaFeaturesHeader    = "X-Codex-Beta-Features"
@@ -43,11 +46,66 @@ type TurnMetadata struct {
 // Codex session shape.
 var PassthroughHeaders = []string{
 	TurnMetadataHeader,
+	TurnStateHeader,
 	WindowIDHeader,
 	ClientRequestIDHeader,
 	BetaFeaturesHeader,
 	ThreadIDHeader,
 	ResponsesLiteHeader,
+}
+
+// clientFingerprintHeaders lists client-private attribution headers that no
+// Codex upstream consumes. They are exact-name matches.
+//
+// Http-Referer is the non-standard spelling of Referer used by several coding
+// clients (the canonical Referer is already blocked globally in httpclient).
+// X-Title and X-Platform are OpenRouter-style attribution headers: legitimate on
+// the channels that consume them, but pure client fingerprint on the ChatGPT
+// Codex backend, which is why they are scrubbed here rather than blocked
+// globally for every channel.
+var clientFingerprintHeaders = []string{
+	"Http-Referer",
+	"X-Title",
+	"X-Platform",
+}
+
+// clientFingerprintHeaderPrefixes lists client-private header families that no
+// Codex upstream consumes.
+var clientFingerprintHeaderPrefixes = []string{
+	"X-Zcode-",
+	"X-Os-",
+}
+
+// ScrubClientFingerprintHeaders deletes client-private attribution headers from
+// an inbound request so that the later MergeInboundRequest step cannot copy them
+// onto the outbound request and hand the upstream the client's full fingerprint.
+//
+// This deliberately mirrors the existing Session_id handling in
+// OutboundTransformer.TransformRequest: MergeInboundRequest runs after the
+// transformer, so the only way for a transformer to keep a header off the wire
+// is to remove it from the inbound request it was given.
+//
+// Header names are canonicalized by http.Header, so exact-name lookups match
+// regardless of the case the client used.
+func ScrubClientFingerprintHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+
+	for _, name := range clientFingerprintHeaders {
+		headers.Del(name)
+	}
+
+	// Deleting during range is safe in Go.
+	for name := range headers {
+		for _, prefix := range clientFingerprintHeaderPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				headers.Del(name)
+
+				break
+			}
+		}
+	}
 }
 
 func ExtractSessionIDFromTurnMetadata(raw string) string {
@@ -96,4 +154,57 @@ func GetSessionIDFromHeaders(headers http.Header) string {
 	}
 
 	return ExtractSessionIDFromTurnMetadata(strings.TrimSpace(headers.Get(TurnMetadataHeader)))
+}
+
+func applyCodexSessionHeaders(headers http.Header, accountID string) {
+	// Fabricate the remaining Codex identity headers for non-Codex inbound
+	// clients so the upstream always sees a complete Codex session shape.
+	sessionID := headers.Get(SessionHeaderHyphen)
+	windowID := sessionID + ":0"
+	if headers.Get(ThreadIDHeader) == "" {
+		// Codex clients send Thread-Id equal to Session-Id (both identify the
+		// conversation/thread); keep thread-scoped upstream behavior (e.g.
+		// prompt caching) consistent for non-Codex clients too.
+		headers.Set(ThreadIDHeader, sessionID)
+	}
+	if headers.Get(WindowIDHeader) == "" {
+		headers.Set(WindowIDHeader, windowID)
+	}
+	if headers.Get(TurnMetadataHeader) == "" {
+		installationID := ""
+		if accountID != "" {
+			// Deterministic per-account installation id derived from the
+			// ChatGPT account id.
+			installationID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(accountID)).String()
+		}
+		turnMetadata, _ := json.Marshal(TurnMetadata{
+			InstallationID:      installationID,
+			SessionID:           sessionID,
+			ThreadID:            sessionID,
+			TurnID:              uuid.NewString(),
+			WindowID:            windowID,
+			RequestKind:         "turn",
+			ThreadSource:        "user",
+			Sandbox:             "none",
+			TurnStartedAtUnixMS: turnStartedAtUnixMS(sessionID),
+		})
+		headers.Set(TurnMetadataHeader, string(turnMetadata))
+	}
+	if headers.Get(ClientRequestIDHeader) == "" {
+		headers.Set(ClientRequestIDHeader, uuid.NewString())
+	}
+
+	if accountID != "" {
+		headers.Set("Chatgpt-Account-Id", accountID)
+	}
+
+	if headers.Get("Conversation_id") == "" {
+		if sessionID := headers.Get(SessionHeaderHyphen); sessionID != "" {
+			headers.Set("Conversation_id", sessionID)
+		}
+	}
+
+	if headers.Get("Version") == "" {
+		headers.Set("Version", codexDefaultVersion)
+	}
 }

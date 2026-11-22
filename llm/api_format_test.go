@@ -9,6 +9,7 @@ import (
 func TestIsOpenAIResponsesFormat(t *testing.T) {
 	require.True(t, IsOpenAIResponsesFormat(APIFormatOpenAIResponse))
 	require.True(t, IsOpenAIResponsesFormat(APIFormatOpenAIResponseCompact))
+	require.True(t, IsOpenAIResponsesFormat(APIFormatOpenAIResponseWebSocket))
 	require.False(t, IsOpenAIResponsesFormat(APIFormatOpenAIChatCompletion))
 	require.False(t, IsOpenAIResponsesFormat(APIFormatAnthropicMessage))
 }

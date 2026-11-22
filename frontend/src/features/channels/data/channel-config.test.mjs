@@ -57,6 +57,68 @@ test('Fenno exposes a third-party Codex channel', () => {
   assert.ok(providersConfig.indexOf('qiniu:') < providersConfig.indexOf('fenno:'));
 });
 
+test('Bailian exposes native Responses with the officially documented fully compatible models', () => {
+  const schema = read('features/channels/data/schema.ts');
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const providersConfig = read('features/channels/data/config_providers.ts');
+
+  assert.match(schema, /channelTypeSchema[\s\S]*'bailian_responses'/);
+  assert.match(
+    channelsConfig,
+    /bailian_responses:\s*{[\s\S]*baseURL:\s*'https:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1'[\s\S]*apiFormat:\s*OPENAI_RESPONSES/
+  );
+  assert.match(providersConfig, /bailian:\s*{[\s\S]*channelTypes:\s*\[\s*'bailian',\s*'bailian_anthropic',\s*'bailian_responses'\s*\]/);
+
+  const configBlock = channelsConfig.match(/bailian_responses:\s*{([\s\S]*?)\n  },\n  bailian_anthropic:/)?.[1] ?? '';
+  const modelsBlock = configBlock.match(/defaultModels:\s*\[([\s\S]*?)\]/)?.[1] ?? '';
+  const models = [...modelsBlock.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  assert.deepEqual(models, [
+    'qwen3.8-max',
+    'qwen3.8-max-0902',
+    'qwen3.8-flash',
+    'qwen3.8-2.4t-a95b',
+    'qwen3.8-27b',
+    'qwen3.8-omni-flash',
+    'qwen3.7-max',
+    'qwen3.7-max-2026-05-20',
+    'qwen3.7-max-2026-06-08',
+    'qwen3.7-max-2026-05-17',
+    'qwen3.7-max-preview',
+    'qwen3-max',
+    'qwen3-max-2026-01-23',
+    'qwen3.7-plus',
+    'qwen3.7-plus-2026-05-26',
+    'qwen3.6-plus',
+    'qwen3.6-plus-2026-04-02',
+    'qwen3.5-plus',
+    'qwen3.5-plus-2026-04-20',
+    'qwen3.5-plus-2026-02-15',
+    'qwen3.7-flash',
+    'qwen3.7-flash-2026-07-15',
+    'qwen3.6-flash',
+    'qwen3.6-flash-2026-04-16',
+    'qwen3.5-flash',
+    'qwen3.5-flash-2026-02-23',
+    'qwen3.6-35b-a3b',
+    'qwen3.5-397b-a17b',
+    'qwen3.5-122b-a10b',
+    'qwen3.5-27b',
+    'qwen3.5-35b-a3b',
+    'deepseek-v4.1-flash',
+    'deepseek-v4-pro',
+    'deepseek-v4-pro-0813',
+    'deepseek-v4-flash',
+    'deepseek-v4-flash-0731',
+    'glm-5.3',
+    'glm-5.2',
+    'kimi-k3',
+  ]);
+
+  const en = parseLocale('en');
+  const zh = parseLocale('zh-CN');
+  assert.equal(en['channels.types.bailian_responses'], 'Bailian (Responses)');
+  assert.equal(zh['channels.types.bailian_responses'], '百炼 (Responses)');
+});
 
 test('Cline has localized channel and provider labels', () => {
   for (const locale of ['en', 'zh-CN']) {
@@ -137,6 +199,10 @@ test('quota selection follows quota column visibility and preserves normalized f
   assert.equal(zhSystem['quota.window.5h'], '5小时窗口');
   assert.equal(zhSystem['quota.window.7d'], '7天窗口');
   assert.equal(zhSystem['quota.window.cycle'], '周期窗口');
+  assert.equal(enSystem['quota.window.search_hourly'], 'Search · hourly');
+  assert.equal(zhSystem['quota.window.search_hourly'], '搜索 · 每小时');
+  assert.equal(enSystem['quota.label.search_requests'], 'Search requests');
+  assert.equal(zhSystem['quota.label.search_requests'], '搜索请求');
 });
 
 test('filter-only model column stays hidden while model filtering remains configured', () => {
@@ -307,16 +373,62 @@ test('Ollama exposes OpenAI and Anthropic channel variants with a quota cookie f
   );
 });
 
-test('Ollama has localized channel, provider, cookie field, and quota-collection labels', () => {
+test('Cloudflare Workers AI is available as a channel type in frontend schemas and configs', () => {
+  const schema = read('features/channels/data/schema.ts');
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const providersConfig = read('features/channels/data/config_providers.ts');
+  const protocolOptions = read('features/channels/data/protocol-options.ts');
+
+  assert.match(schema, /channelTypeSchema[\s\S]*'cloudflare'/, 'channelTypeSchema should accept cloudflare');
+  assert.match(
+    channelsConfig,
+    /cloudflare:\s*{[\s\S]*?channelType:\s*'cloudflare'[\s\S]*?baseURL:\s*'https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/<account_id>\/ai'[\s\S]*?apiFormat:\s*OPENAI_CHAT_COMPLETIONS,/,
+    'Cloudflare should use the account-scoped Workers AI base URL with OpenAI chat completions'
+  );
+  assert.match(
+    channelsConfig,
+    /CHANNEL_TYPE_TO_PROVIDER[\s\S]*cloudflare:\s*'cloudflare'/,
+    'Cloudflare should map to the Cloudflare provider'
+  );
+  assert.match(
+    providersConfig,
+    /cloudflare:\s*{[\s\S]*?channelTypes:\s*\[\s*'cloudflare'\s*\]/,
+    'PROVIDER_CONFIGS should expose a Cloudflare provider'
+  );
+  assert.match(
+    protocolOptions,
+    /channelType === 'cloudflare' \|\| format !== 'typesafe\/systemone'/,
+    'System One should be configurable for Cloudflare channels only'
+  );
+  assert.match(
+    schema,
+    /Replace placeholders such as <account_id> with real values/,
+    'the channel base URL should reject unresolved placeholders'
+  );
+  assert.doesNotMatch(
+    channelsConfig,
+    /@cf\/cloudflare\/clef/,
+    'Cloudflare default models must be servable by the default endpoints'
+  );
+});
+
+test('Cloudflare has localized channel and provider labels', () => {
   for (const locale of ['en', 'zh-CN']) {
     const channels = parseLocale(locale);
-    const system = JSON.parse(read(`locales/${locale}/system.json`));
+
+    assert.equal(channels['channels.types.cloudflare'], 'Cloudflare');
+    assert.equal(channels['channels.providers.cloudflare'], 'Cloudflare');
+  }
+});
+
+test('Ollama has localized channel, provider, and cookie-field labels', () => {
+  for (const locale of ['en', 'zh-CN']) {
+    const channels = parseLocale(locale);
 
     assert.equal(channels['channels.types.ollama'], 'Ollama');
     assert.equal(channels['channels.providers.ollama'], 'Ollama');
     assert.ok(channels['channels.types.ollama_anthropic']);
     assert.ok(channels['channels.dialogs.fields.ollamaQuota.authCookie.placeholder'].includes('__Secure-session'));
     assert.ok(channels['channels.dialogs.fields.ollamaQuota.authCookie.description']);
-    assert.ok(system['system.quota.collection.providers.ollama']);
   }
 });

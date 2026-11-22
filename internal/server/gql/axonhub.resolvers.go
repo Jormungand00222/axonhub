@@ -37,7 +37,7 @@ func (r *channelResolver) DefaultEndpoints(ctx context.Context, obj *ent.Channel
 		return []*objects.ChannelEndpoint{}, nil
 	}
 
-	endpoints := biz.DefaultEndpointsForChannelType(obj.Type)
+	endpoints := (&biz.Channel{Channel: obj}).DefaultEndpoints()
 	if len(endpoints) == 0 {
 		return []*objects.ChannelEndpoint{}, nil
 	}
@@ -70,8 +70,37 @@ func (r *channelResolver) Credentials(ctx context.Context, obj *ent.Channel) (*o
 		return &creds, nil
 	}
 
+	// Vertex credentials are project-bound triples and are surfaced through
+	// vertexApiKeys instead, so the edit form can echo the project and region back.
+	// Their keys must not also appear in the flat apiKeys list: that would present
+	// them as project-less keys and lose the binding on the next save.
+	//
+	// A non-Vertex channel exposes neither form. Legacy rows can still carry a
+	// binding, and leaking it would offer a Google-project key to an unrelated
+	// provider; the key is dropped from apiKeys for the same reason.
+	apiKeys := creds.GetAllAPIKeys()
+	if len(creds.VertexAPIKeys) > 0 {
+		vertexKeys := make(map[string]struct{}, len(creds.VertexAPIKeys))
+		for _, credential := range creds.VertexAPIKeys {
+			vertexKeys[credential.APIKey] = struct{}{}
+		}
+
+		apiKeys = lo.Filter(apiKeys, func(key string, _ int) bool {
+			_, isVertex := vertexKeys[key]
+			return !isVertex
+		})
+	}
+
+	if obj.Type != channel.TypeGeminiVertex {
+		creds.VertexAPIKeys = nil
+	}
+
+	if len(apiKeys) == 0 {
+		apiKeys = nil
+	}
+
 	// For non-OAuth channel types, use api keys array.
-	creds.APIKeys = creds.GetAllAPIKeys()
+	creds.APIKeys = apiKeys
 	creds.APIKey = ""
 
 	return &creds, nil
@@ -190,9 +219,19 @@ func (r *mutationResolver) UpdateChannel(ctx context.Context, id objects.GUID, i
 	return r.channelService.UpdateChannel(ctx, id.ID, &input)
 }
 
+// UpdateChannelSettings is the resolver for the updateChannelSettings field.
+func (r *mutationResolver) UpdateChannelSettings(ctx context.Context, id objects.GUID, input biz.UpdateChannelSettingsInput) (*ent.Channel, error) {
+	return r.channelService.UpdateChannelSettings(ctx, id.ID, &input)
+}
+
 // SaveChannelEndpoints is the resolver for the saveChannelEndpoints field.
 func (r *mutationResolver) SaveChannelEndpoints(ctx context.Context, input biz.SaveChannelEndpointsInput) (*ent.Channel, error) {
 	return r.channelService.SaveChannelEndpoints(ctx, input)
+}
+
+// DetectChannelEndpoints is the resolver for the detectChannelEndpoints field.
+func (r *mutationResolver) DetectChannelEndpoints(ctx context.Context, input biz.DetectChannelEndpointsInput) (*biz.DetectChannelEndpointsPayload, error) {
+	return r.channelService.DetectChannelEndpoints(ctx, input)
 }
 
 // UpdateChannelStatus is the resolver for the updateChannelStatus field.
@@ -258,6 +297,39 @@ func (r *mutationResolver) BulkDeleteChannels(ctx context.Context, ids []*object
 	channelIDs := objects.IntGuids(ids)
 
 	if err := r.channelService.BulkDeleteChannels(ctx, channelIDs); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// BulkAddChannelTags is the resolver for the bulkAddChannelTags field.
+func (r *mutationResolver) BulkAddChannelTags(ctx context.Context, ids []*objects.GUID, tags []string) (bool, error) {
+	channelIDs := objects.IntGuids(ids)
+
+	if err := r.channelService.BulkAddChannelTags(ctx, channelIDs, tags); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// BulkRemoveChannelTags is the resolver for the bulkRemoveChannelTags field.
+func (r *mutationResolver) BulkRemoveChannelTags(ctx context.Context, ids []*objects.GUID, tags []string) (bool, error) {
+	channelIDs := objects.IntGuids(ids)
+
+	if err := r.channelService.BulkRemoveChannelTags(ctx, channelIDs, tags); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// BulkManageChannelTags is the resolver for the bulkManageChannelTags field.
+func (r *mutationResolver) BulkManageChannelTags(ctx context.Context, ids []*objects.GUID, addTags []string, removeTags []string) (bool, error) {
+	channelIDs := objects.IntGuids(ids)
+
+	if err := r.channelService.BulkManageChannelTags(ctx, channelIDs, addTags, removeTags); err != nil {
 		return false, err
 	}
 
@@ -357,6 +429,20 @@ func (r *mutationResolver) BulkUpdateChannelOrdering(ctx context.Context, input 
 	}
 
 	return &BulkUpdateChannelOrderingResult{
+		Success:  true,
+		Updated:  len(updatedChannels),
+		Channels: updatedChannels,
+	}, nil
+}
+
+// BulkUpdateChannelAutoDisable is the resolver for the bulkUpdateChannelAutoDisable field.
+func (r *mutationResolver) BulkUpdateChannelAutoDisable(ctx context.Context, input biz.BulkUpdateChannelAutoDisableInput) (*BulkUpdateChannelAutoDisablePayload, error) {
+	updatedChannels, err := r.channelService.BulkUpdateChannelAutoDisable(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BulkUpdateChannelAutoDisablePayload{
 		Success:  true,
 		Updated:  len(updatedChannels),
 		Channels: updatedChannels,

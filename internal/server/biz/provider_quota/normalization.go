@@ -2,6 +2,7 @@ package provider_quota
 
 import (
 	"math"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,9 @@ func normalizeQuotaDataAt(data QuotaData, now time.Time) QuotaData {
 		nextResetAt = &resetAt
 	}
 	for _, limit := range data.Limits {
+		if isDisplayOnlyLimit(limit) {
+			continue
+		}
 		if limit.NextResetAt != nil && limit.NextResetAt.After(now) &&
 			(nextResetAt == nil || limit.NextResetAt.Before(*nextResetAt)) {
 			resetAt := *limit.NextResetAt
@@ -32,6 +36,21 @@ func normalizeQuotaDataAt(data QuotaData, now time.Time) QuotaData {
 	data.NextResetAt = nextResetAt
 	data.Ready = IsReadyStatus(status)
 	return data
+}
+
+// displayOnlyLimitTypes are listed for the operator but take no part in the
+// channel-level quota status or the channel reset. Routing already ignores
+// them: no RequestModality maps to these types, so routingGroups drops them
+// unless they share an AvailabilityGroup with a routable limit — hence the
+// group guard below.
+var displayOnlyLimitTypes = map[QuotaLimitType]struct{}{
+	QuotaLimitTypeSearch: {},
+}
+
+func isDisplayOnlyLimit(limit QuotaLimitStatus) bool {
+	_, ok := displayOnlyLimitTypes[limit.Type]
+
+	return ok && limit.AvailabilityGroup == ""
 }
 
 func normalizeOverallQuotaStatus(explicitStatus string, limits []QuotaLimitStatus) string {
@@ -47,6 +66,9 @@ func normalizeOverallQuotaStatus(explicitStatus string, limits []QuotaLimitStatu
 	hasExhausted := false
 
 	for _, limit := range limits {
+		if isDisplayOnlyLimit(limit) {
+			continue
+		}
 		switch {
 		case IsReadyStatus(limit.Status):
 			if bestReadyStatus == "" || normalizedQuotaStatusRank(limit.Status) > normalizedQuotaStatusRank(bestReadyStatus) {
@@ -96,7 +118,13 @@ func normalizeQuotaLimits(limits []QuotaLimitStatus, now time.Time) []QuotaLimit
 			limit.PeriodStart = nil
 		}
 
-		identity := string(limit.Type) + "\x00" + limit.Window
+		// Limits of different accounts of one channel share a window, so the
+		// account identity stays part of the key. Without it two keys would
+		// collapse into a single limit and the capacity of the healthier
+		// account would be lost.
+		identity := strings.Join([]string{
+			string(limit.Type), limit.Window, limit.AvailabilityGroup, limit.Account,
+		}, "\x00")
 		if index, ok := indexes[identity]; ok {
 			mergeQuotaLimit(&normalized[index], limit)
 			continue

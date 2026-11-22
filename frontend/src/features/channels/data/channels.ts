@@ -1,12 +1,14 @@
-import { z } from 'zod';
 import { useEffect } from 'react';
+import { z } from 'zod';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import { pageInfoSchema } from '@/gql/pagination';
-import { shouldNotifyChannelQueryError } from './channel-query-error';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
+import { useSelectedProjectId } from '@/stores/projectStore';
 import { useErrorHandler } from '@/hooks/use-error-handler';
+import { mergeChannelSettingsForUpdate } from '../utils/merge';
+import { shouldNotifyChannelQueryError } from './channel-query-error';
 import {
   Channel,
   ChannelConnection,
@@ -22,6 +24,11 @@ import {
   BulkUpdateChannelOrderingInput,
   BulkUpdateChannelOrderingResult,
   bulkUpdateChannelOrderingResultSchema,
+  BulkUpdateChannelAutoDisableInput,
+  BulkUpdateChannelAutoDisablePayload,
+  bulkUpdateChannelAutoDisablePayloadSchema,
+  ChannelAutoDisableCopySource,
+  channelAutoDisableCopySourceSchema,
   channelSummaryConnectionSchema,
   ChannelSettings,
   ProxyConfig,
@@ -33,8 +40,9 @@ import {
   testChannelAPIKeysPayloadSchema,
   TestAPIKeyResult,
   testAPIKeyResultSchema,
+  DetectedChannelEndpoint,
+  detectedChannelEndpointSchema,
 } from './schema';
-import { mergeChannelSettingsForUpdate } from '../utils/merge';
 
 const QUERY_CHANNEL_NAMES_QUERY = `
   query QueryChannelNames($input: QueryChannelInput!) {
@@ -80,7 +88,16 @@ const CREATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
-        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
@@ -115,11 +132,19 @@ const CREATE_CHANNEL_MUTATION = `
         }
         passThroughUserAgent
         passThroughBody
+        responseTimeout {
+          mode
+          streamFirstEventTimeoutSeconds
+          nonStreamResponseTimeoutSeconds
+        }
         retryableStatusCodes
+        apiKeyStrategy
+        apiKeyRoundRobinSwitchAfter
         retryableErrorPatterns {
           pattern
           regex
         }
+        maxSingleChannelRetries
         modelProtocols {
           model
           apiFormats
@@ -164,7 +189,16 @@ const DUPLICATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
-        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
@@ -199,11 +233,19 @@ const DUPLICATE_CHANNEL_MUTATION = `
         }
         passThroughUserAgent
         passThroughBody
+        responseTimeout {
+          mode
+          streamFirstEventTimeoutSeconds
+          nonStreamResponseTimeoutSeconds
+        }
         retryableStatusCodes
+        apiKeyStrategy
+        apiKeyRoundRobinSwitchAfter
         retryableErrorPatterns {
           pattern
           regex
         }
+        maxSingleChannelRetries
         modelProtocols {
           model
           apiFormats
@@ -248,7 +290,16 @@ const BULK_CREATE_CHANNELS_MUTATION = `
       status
       policies {
         stream
-        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
@@ -283,11 +334,19 @@ const BULK_CREATE_CHANNELS_MUTATION = `
         }
         passThroughUserAgent
         passThroughBody
+        responseTimeout {
+          mode
+          streamFirstEventTimeoutSeconds
+          nonStreamResponseTimeoutSeconds
+        }
         retryableStatusCodes
+        apiKeyStrategy
+        apiKeyRoundRobinSwitchAfter
         retryableErrorPatterns {
           pattern
           regex
         }
+        maxSingleChannelRetries
         modelProtocols {
           model
           apiFormats
@@ -320,9 +379,8 @@ const BULK_CREATE_CHANNELS_MUTATION = `
   }
 `;
 
-const UPDATE_CHANNEL_MUTATION = `
-  mutation UpdateChannel($id: ID!, $input: UpdateChannelInput!) {
-    updateChannel(id: $id, input: $input) {
+const CHANNEL_FIELDS_FRAGMENT = `
+  fragment ChannelMutationFields on Channel {
       id
       type
       createdAt
@@ -332,7 +390,16 @@ const UPDATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
-        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
@@ -367,11 +434,19 @@ const UPDATE_CHANNEL_MUTATION = `
         }
         passThroughUserAgent
         passThroughBody
+        responseTimeout {
+          mode
+          streamFirstEventTimeoutSeconds
+          nonStreamResponseTimeoutSeconds
+        }
         retryableStatusCodes
+        apiKeyStrategy
+        apiKeyRoundRobinSwitchAfter
         retryableErrorPatterns {
           pattern
           regex
         }
+        maxSingleChannelRetries
         modelProtocols {
           model
           apiFormats
@@ -401,6 +476,23 @@ const UPDATE_CHANNEL_MUTATION = `
         baseURL
         transport
       }
+  }
+`;
+
+const UPDATE_CHANNEL_MUTATION = `${CHANNEL_FIELDS_FRAGMENT}
+  mutation UpdateChannel($id: ID!, $input: UpdateChannelInput!) {
+    updateChannel(id: $id, input: $input) {
+      ...ChannelMutationFields
+    }
+  }
+`;
+
+// Server-side settings patch: absent fields keep their stored values, so the
+// caller does not need to refetch and re-submit the whole settings object.
+const UPDATE_CHANNEL_SETTINGS_MUTATION = `${CHANNEL_FIELDS_FRAGMENT}
+  mutation UpdateChannelSettings($id: ID!, $input: UpdateChannelSettingsInput!) {
+    updateChannelSettings(id: $id, input: $input) {
+      ...ChannelMutationFields
     }
   }
 `;
@@ -450,6 +542,12 @@ const BULK_DELETE_CHANNELS_MUTATION = `
   }
 `;
 
+const BULK_MANAGE_CHANNEL_TAGS_MUTATION = `
+  mutation BulkManageChannelTags($ids: [ID!]!, $addTags: [String!]!, $removeTags: [String!]!) {
+    bulkManageChannelTags(ids: $ids, addTags: $addTags, removeTags: $removeTags)
+  }
+`;
+
 const SAVE_CHANNEL_ENDPOINTS_MUTATION = `
   mutation SaveChannelEndpoints($input: SaveChannelEndpointsInput!) {
     saveChannelEndpoints(input: $input) {
@@ -479,6 +577,19 @@ const TEST_CHANNEL_MUTATION = `
       success
       error
       message
+    }
+  }
+`;
+
+const DETECT_CHANNEL_ENDPOINTS_MUTATION = `
+  mutation DetectChannelEndpoints($input: DetectChannelEndpointsInput!) {
+    detectChannelEndpoints(input: $input) {
+      endpoints {
+        apiFormat
+        supported
+        statusCode
+        reason
+      }
     }
   }
 `;
@@ -566,11 +677,19 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
           }
           passThroughUserAgent
           passThroughBody
+          responseTimeout {
+            mode
+            streamFirstEventTimeoutSeconds
+            nonStreamResponseTimeoutSeconds
+          }
           retryableStatusCodes
+          apiKeyStrategy
+          apiKeyRoundRobinSwitchAfter
           retryableErrorPatterns {
             pattern
             regex
           }
+          maxSingleChannelRetries
           modelProtocols {
             model
             apiFormats
@@ -806,11 +925,19 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
           }
           passThroughUserAgent
           passThroughBody
+          responseTimeout {
+            mode
+            streamFirstEventTimeoutSeconds
+            nonStreamResponseTimeoutSeconds
+          }
           retryableStatusCodes
+          apiKeyStrategy
+          apiKeyRoundRobinSwitchAfter
           retryableErrorPatterns {
             pattern
             regex
           }
+          maxSingleChannelRetries
           modelProtocols {
             model
             apiFormats
@@ -855,6 +982,54 @@ const ALL_CHANNEL_SUMMARYS_QUERY = `
   }
 `;
 
+const CHANNEL_AUTO_DISABLE_COPY_SOURCES_QUERY = `
+  query ChannelAutoDisableCopySources {
+    allChannelSummarys {
+      id
+      name
+      policies {
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
+      }
+    }
+  }
+`;
+
+// Bulk auto-disable actions: write_rules, inherit, off
+const BULK_UPDATE_CHANNEL_AUTO_DISABLE_MUTATION = `
+  mutation BulkUpdateChannelAutoDisable($input: BulkUpdateChannelAutoDisableInput!) {
+    bulkUpdateChannelAutoDisable(input: $input) {
+      success
+      updated
+      channels {
+        id
+        name
+        policies {
+          stream
+          apiKeyAutoDisableMode
+          apiKeyAutoDisableRules {
+            statusCodes
+            keywordPatterns
+            times
+            action
+            disableDurationMinutes
+            disableUntilCron
+            disableUntilTimezone
+          }
+        }
+      }
+    }
+  }
+`;
+
 const FETCH_MODELS_QUERY = `
   query FetchModels($input: FetchModelsInput!) {
     fetchModels(input: $input) {
@@ -881,12 +1056,39 @@ const ALL_CHANNEL_TAGS_QUERY = `
   }
 `;
 
+const SELECTED_CHANNEL_TAGS_QUERY = `
+  query SelectedChannelTags($input: QueryChannelInput!) {
+    queryChannels(input: $input) {
+      edges {
+        node {
+          id
+          tags
+        }
+      }
+    }
+  }
+`;
+
+const selectedChannelTagsResponseSchema = z.object({
+  queryChannels: z.object({
+    edges: z.array(
+      z.object({
+        node: z.object({
+          id: z.string(),
+          tags: z.array(z.string()).optional().nullable(),
+        }),
+      })
+    ),
+  }),
+});
+
 export type ChannelListColumnVisibility = Record<string, boolean>;
 
 export const DEFAULT_CHANNEL_COLUMN_VISIBILITY: ChannelListColumnVisibility = {
   model: false,
   tags: false,
   proxy: false,
+  endpointProtocols: true,
 };
 
 const channelListColumnVisibilitySchema = z.record(z.string(), z.boolean());
@@ -906,11 +1108,25 @@ const CHANNEL_QUERY_FULL_NODE_SELECTION = `
           status
           policies {
             stream
-            apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
+            apiKeyAutoDisableMode
+            apiKeyAutoDisableRules {
+              statusCodes
+              keywordPatterns
+              times
+              action
+              disableDurationMinutes
+              disableUntilCron
+              disableUntilTimezone
+            }
           }
           credentials {
             apiKey
             apiKeys
+            vertexApiKeys {
+              projectID
+              apiKey
+              region
+            }
             gcp {
               region
               projectID
@@ -978,6 +1194,11 @@ const CHANNEL_QUERY_FULL_NODE_SELECTION = `
             }
             passThroughUserAgent
             passThroughBody
+            responseTimeout {
+              mode
+              streamFirstEventTimeoutSeconds
+              nonStreamResponseTimeoutSeconds
+            }
             rateLimit {
               rpm
               tpm
@@ -986,10 +1207,13 @@ const CHANNEL_QUERY_FULL_NODE_SELECTION = `
               queueTimeoutMs
             }
             retryableStatusCodes
+            apiKeyStrategy
+            apiKeyRoundRobinSwitchAfter
             retryableErrorPatterns {
               pattern
               regex
             }
+            maxSingleChannelRetries
             modelProtocols {
               model
               apiFormats
@@ -1118,14 +1342,26 @@ const CHANNEL_QUERY_QUOTA_SELECTION = `
           }
 `;
 
+const CHANNEL_QUERY_ENDPOINTS_SELECTION = `
+          defaultEndpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
+          endpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
+`;
+
 function isChannelColumnVisible(columnVisibility: ChannelListColumnVisibility | undefined, columnID: string): boolean {
   return columnVisibility?.[columnID] !== false;
 }
 
-export function buildQueryChannelsQuery(
-  columnVisibility?: ChannelListColumnVisibility,
-  options?: { full?: boolean }
-): string {
+export function buildQueryChannelsQuery(columnVisibility?: ChannelListColumnVisibility, options?: { full?: boolean }): string {
   const nodeSelection = options?.full
     ? CHANNEL_QUERY_FULL_NODE_SELECTION
     : [
@@ -1137,6 +1373,7 @@ export function buildQueryChannelsQuery(
         isChannelColumnVisible(columnVisibility, 'orderingWeight') ? CHANNEL_QUERY_ORDERING_WEIGHT_SELECTION : '',
         isChannelColumnVisible(columnVisibility, 'health') ? CHANNEL_QUERY_HEALTH_SELECTION : '',
         isChannelColumnVisible(columnVisibility, 'quota') ? CHANNEL_QUERY_QUOTA_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'endpointProtocols') ? CHANNEL_QUERY_ENDPOINTS_SELECTION : '',
       ].join('');
 
   return `
@@ -1412,6 +1649,14 @@ async function updateChannelRequest(id: string, input: UpdateChannelInput): Prom
   return channelSchema.parse(data.updateChannel);
 }
 
+async function updateChannelSettingsRequest(id: string, patch: Partial<ChannelSettings>): Promise<Channel> {
+  const data = await graphqlRequest<{ updateChannelSettings: Channel }>(UPDATE_CHANNEL_SETTINGS_MUTATION, {
+    id,
+    input: patch,
+  });
+  return channelSchema.parse(data.updateChannelSettings);
+}
+
 async function fetchLatestChannel(channelID: string): Promise<Channel> {
   const data = await graphqlRequest<{ queryChannels: ChannelConnection }>(QUERY_CHANNELS_QUERY, {
     input: {
@@ -1476,6 +1721,19 @@ export interface UpdateChannelSettingsMutationInput {
  * Updates one settings patch against the latest server snapshot. Mutations for
  * the same channel are serialized so a stale dialog cannot overwrite a patch
  * that was committed immediately before it.
+ *
+ * Without other channel fields, the patch is sent to the server-side
+ * updateChannelSettings mutation, which merges it onto the stored settings
+ * under an expected-version guard: no refetch round trip, no risk of a stale
+ * client snapshot wiping settings the caller did not touch, and concurrent
+ * settings-only edits no longer replace each other. When other channel
+ * fields are included, they must be committed atomically with the settings
+ * patch (e.g. endpoints together with model protocol overrides), so the
+ * combined update goes through updateChannel with a client-side merge onto
+ * the latest snapshot. Patches that carry an explicit null meant to clear a
+ * stored value also take that path: the GraphQL patch input cannot
+ * distinguish null from absence, so the null clear must be applied by the
+ * client-side merge.
  */
 export function useUpdateChannelSettings() {
   const queryClient = useQueryClient();
@@ -1485,9 +1743,24 @@ export function useUpdateChannelSettings() {
   return useMutation({
     mutationFn: ({ id, patch, input }: UpdateChannelSettingsMutationInput) =>
       enqueueChannelSettingsUpdate(id, async () => {
+        // Settings-only edits go through the server-side patch mutation, which
+        // merges under an expected-version guard and retries on conflict. An
+        // input object with no channel fields (callers may pass an empty
+        // object after pruning fields) is settings-only too.
+        const hasChannelFields = Object.values(input ?? {}).some((value) => value !== undefined);
+        // The GraphQL patch input cannot distinguish an explicit null from an
+        // absent field, so patches that use null to clear a stored value
+        // (e.g. rateLimit: null, providerQuota: null) must keep the
+        // clear-capable full-update path, where the client-side merge applies
+        // the null.
+        const hasExplicitNullClear = Object.values(patch ?? {}).some((value) => value === null);
+        if (!hasChannelFields && !hasExplicitNullClear) {
+          return updateChannelSettingsRequest(id, patch);
+        }
+
         const latest = await fetchLatestChannel(id);
         return updateChannelRequest(id, {
-          ...input,
+          ...input!,
           settings: mergeChannelSettingsForUpdate(latest.settings, patch),
         });
       }),
@@ -1524,6 +1797,35 @@ export function useSaveChannelEndpoints() {
     },
     onError: (error) => {
       handleError(error, { context: t('channels.dialogs.edit.title') });
+    },
+  });
+}
+
+export interface DetectChannelEndpointsInput {
+  channelID: string;
+  model?: string;
+}
+
+/**
+ * Probes a channel upstream for the relay protocols it exposes. This is a
+ * read-only detection: nothing is persisted until the caller saves the
+ * detected endpoints.
+ */
+export function useDetectChannelEndpoints() {
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: DetectChannelEndpointsInput) => {
+      const data = await graphqlRequest<{ detectChannelEndpoints: { endpoints: DetectedChannelEndpoint[] } }>(
+        DETECT_CHANNEL_ENDPOINTS_MUTATION,
+        { input }
+      );
+
+      return (data.detectChannelEndpoints?.endpoints ?? []).map((endpoint) => detectedChannelEndpointSchema.parse(endpoint));
+    },
+    onError: (error) => {
+      handleError(error, { context: t('channels.endpoints.detect.title') });
     },
   });
 }
@@ -1722,12 +2024,45 @@ export function useBulkDeleteChannels() {
   });
 }
 
+export function useBulkManageChannelTags() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async ({ ids, addTags, removeTags }: { ids: string[]; addTags: string[]; removeTags: string[] }) => {
+      try {
+        const data = await graphqlRequest<{ bulkManageChannelTags: boolean }>(BULK_MANAGE_CHANNEL_TAGS_MUTATION, {
+          ids,
+          addTags,
+          removeTags,
+        });
+        return data.bulkManageChannelTags;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Manage Channel Tags' });
+        throw error;
+      }
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelSummarys'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelTags'] });
+      queryClient.invalidateQueries({ queryKey: ['selectedChannelTags'] });
+      toast.success(t('channels.messages.bulkManageTagsSuccess', { count: variables.ids.length }));
+    },
+    onError: () => {
+      queryClient.invalidateQueries({ queryKey: ['selectedChannelTags'] });
+    },
+  });
+}
+
 export function useTestChannel(options?: { silent?: boolean }) {
   const { t } = useTranslation();
   const { handleError } = useErrorHandler();
   const silent = options?.silent ?? false;
 
   return useMutation({
+    // prettier-ignore
     mutationFn: async ({
       channelID,
       modelID,
@@ -1881,6 +2216,58 @@ export function useAllChannelSummarys(projectId?: string | null, options?: { ena
   });
 }
 
+export function useChannelAutoDisableCopySources(options?: { enabled?: boolean }) {
+  const { handleError } = useErrorHandler();
+  const { t } = useTranslation();
+  const projectId = useSelectedProjectId();
+
+  return useQuery({
+    queryKey: ['channelAutoDisableCopySources', projectId],
+    queryFn: async () => {
+      try {
+        const headers = projectId ? { 'X-Project-ID': projectId } : undefined;
+        const data = await graphqlRequest<{ allChannelSummarys: ChannelAutoDisableCopySource[] }>(
+          CHANNEL_AUTO_DISABLE_COPY_SOURCES_QUERY,
+          undefined,
+          headers
+        );
+        return z.array(channelAutoDisableCopySourceSchema).parse(data.allChannelSummarys ?? []);
+      } catch (error) {
+        handleError(error, t('common.errors.internalServerError'));
+        throw error;
+      }
+    },
+    enabled: options?.enabled === true,
+  });
+}
+
+export function useBulkUpdateChannelAutoDisable() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: BulkUpdateChannelAutoDisableInput) => {
+      try {
+        const data = await graphqlRequest<{ bulkUpdateChannelAutoDisable: BulkUpdateChannelAutoDisablePayload }>(
+          BULK_UPDATE_CHANNEL_AUTO_DISABLE_MUTATION,
+          { input }
+        );
+        return bulkUpdateChannelAutoDisablePayloadSchema.parse(data.bulkUpdateChannelAutoDisable);
+      } catch (error) {
+        handleError(error, { context: 'Bulk Update Channel Auto Disable' });
+        throw error;
+      }
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelSummarys'] });
+      queryClient.invalidateQueries({ queryKey: ['channelAutoDisableCopySources'] });
+      toast.success(t('channels.bulkAutoDisable.success', { count: data.updated }));
+    },
+  });
+}
+
 export function useBulkUpdateChannelOrdering() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
@@ -1954,7 +2341,14 @@ export function useFetchModels() {
   const { handleError } = useErrorHandler();
 
   return useMutation({
-    mutationFn: async (input: { channelType: string; baseURL: string; apiKey?: string; channelID?: string }) => {
+    mutationFn: async (input: {
+      channelType: string;
+      baseURL: string;
+      apiKey?: string;
+      projectID?: string;
+      region?: string;
+      channelID?: string;
+    }) => {
       try {
         const data = await graphqlRequest<{
           fetchModels: {
@@ -2058,6 +2452,35 @@ export function useAllChannelTags(projectId?: string | null) {
       }
     },
     staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+}
+
+export function useSelectedChannelTags(channelIDs: string[], options?: { enabled?: boolean }) {
+  const { handleError } = useErrorHandler();
+  const { t } = useTranslation();
+  const sortedChannelIDs = [...channelIDs].sort();
+
+  return useQuery({
+    queryKey: ['selectedChannelTags', sortedChannelIDs],
+    queryFn: async () => {
+      try {
+        const data = await graphqlRequest<unknown>(SELECTED_CHANNEL_TAGS_QUERY, {
+          input: {
+            first: sortedChannelIDs.length,
+            where: { idIn: sortedChannelIDs },
+          },
+        });
+        const parsed = selectedChannelTagsResponseSchema.parse(data);
+        return parsed.queryChannels.edges.map(({ node }) => ({
+          id: node.id,
+          tags: node.tags ?? [],
+        }));
+      } catch (error) {
+        handleError(error, t('common.errors.internalServerError'));
+        throw error;
+      }
+    },
+    enabled: options?.enabled !== false && sortedChannelIDs.length > 0,
   });
 }
 

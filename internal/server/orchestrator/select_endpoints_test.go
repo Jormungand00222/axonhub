@@ -7,8 +7,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/ent/enttest"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
@@ -47,6 +49,45 @@ func TestSelectAPIFormat_PrefersMatchingFormat(t *testing.T) {
 		RequestType: llm.RequestTypeChat,
 		APIFormat:   llm.APIFormatOpenAIChatCompletion,
 	}))
+}
+
+func TestSelectAPIFormat_PrefersResponsesProtocolMatchingInboundTransport(t *testing.T) {
+	// Given both Responses endpoint protocols on one channel and a WS request
+	endpoints := []objects.ChannelEndpoint{
+		{APIFormat: llm.APIFormatOpenAIResponse.String()},
+		{APIFormat: llm.APIFormatOpenAIResponseWebSocket.String()},
+	}
+
+	// When the candidate format is selected
+	format := SelectAPIFormat(endpoints, &llm.Request{
+		RequestType: llm.RequestTypeChat,
+		APIFormat:   llm.APIFormatOpenAIResponseWebSocket,
+	})
+
+	// Then the exact downstream protocol wins instead of the first endpoint
+	require.Equal(t, llm.APIFormatOpenAIResponseWebSocket.String(), format)
+}
+
+func TestResponsesEndpointProtocolMatrix(t *testing.T) {
+	tests := []struct {
+		name   string
+		source llm.APIFormat
+		target llm.APIFormat
+		want   string
+	}{
+		{name: "http to http", source: llm.APIFormatOpenAIResponse, target: llm.APIFormatOpenAIResponse, want: llm.APIFormatOpenAIResponse.String()},
+		{name: "websocket to websocket", source: llm.APIFormatOpenAIResponseWebSocket, target: llm.APIFormatOpenAIResponseWebSocket, want: llm.APIFormatOpenAIResponseWebSocket.String()},
+		{name: "websocket to http", source: llm.APIFormatOpenAIResponseWebSocket, target: llm.APIFormatOpenAIResponse, want: llm.APIFormatOpenAIResponse.String()},
+		{name: "http to websocket", source: llm.APIFormatOpenAIResponse, target: llm.APIFormatOpenAIResponseWebSocket, want: llm.APIFormatOpenAIResponseWebSocket.String()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			format := SelectAPIFormat([]objects.ChannelEndpoint{{APIFormat: tt.target.String()}}, &llm.Request{RequestType: llm.RequestTypeChat, APIFormat: tt.source})
+
+			require.Equal(t, tt.want, format)
+		})
+	}
 }
 
 func TestSelectAPIFormat_FallsBackWhenNoMatch(t *testing.T) {
@@ -97,6 +138,76 @@ func TestSelectAPIFormat_AlphaSearchRequiresExplicitEndpoint(t *testing.T) {
 	require.Empty(t, SelectAPIFormat(endpoints, &llm.Request{
 		RequestType: llm.RequestTypeAlphaSearch,
 		APIFormat:   llm.APIFormatOpenAIAlphaSearch,
+	}))
+}
+
+func TestSelectAPIFormat_DecisionsRequiresExplicitEndpoint(t *testing.T) {
+	// Given a chat-only channel surface and a Decisions request
+	endpoints := []objects.ChannelEndpoint{
+		{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+	}
+
+	// When the request is routed
+	format := SelectAPIFormat(endpoints, &llm.Request{
+		RequestType: llm.RequestTypeDecisions,
+		APIFormat:   llm.APIFormatOpenAIDecisions,
+	})
+
+	// Then no incompatible fallback format is selected
+	require.Empty(t, format)
+}
+
+func TestSpecifiedChannelSelector_DecisionsWithoutEndpointReturnsNoCandidate(t *testing.T) {
+	// Given a specified channel with a model and only a Chat endpoint
+	ctx := authz.WithTestBypass(context.Background())
+	client := enttest.NewEntClient(t, "sqlite3", "file:specified-channel-decisions?mode=memory&_fk=1")
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	channelEntity, err := client.Channel.Create().
+		SetType(channel.TypeOpenai).
+		SetName("chat-only").
+		SetBaseURL("https://example.test").
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"decisions-model"}).
+		SetDefaultTestModel("decisions-model").
+		SetEndpoints([]objects.ChannelEndpoint{{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}}).
+		Save(ctx)
+	require.NoError(t, err)
+
+	channelService := biz.NewChannelServiceForTest(client)
+	t.Cleanup(channelService.Stop)
+	selector := NewSpecifiedChannelSelector(channelService, objects.GUID{Type: "Channel", ID: channelEntity.ID})
+
+	// When the specified selector receives a forced Decisions request
+	candidates, err := selector.Select(ctx, &llm.Request{
+		Model:       "decisions-model",
+		RequestType: llm.RequestTypeDecisions,
+		APIFormat:   llm.APIFormatOpenAIDecisions,
+	})
+
+	// Then the incompatible channel is not retained with an empty API format
+	require.NoError(t, err)
+	require.Empty(t, candidates)
+}
+
+func TestSelectAPIFormat_SystemOneRequiresExplicitEndpoint(t *testing.T) {
+	endpoints := []objects.ChannelEndpoint{
+		{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+		{APIFormat: llm.APIFormatAnthropicMessage.String()},
+	}
+
+	require.Empty(t, SelectAPIFormat(endpoints, &llm.Request{
+		RequestType: llm.RequestTypeSystemOne,
+		APIFormat:   llm.APIFormatTypeSafeSystemOne,
+	}))
+
+	typesafeEndpoints := []objects.ChannelEndpoint{
+		{APIFormat: llm.APIFormatTypeSafeSystemOne.String()},
+	}
+
+	require.Equal(t, llm.APIFormatTypeSafeSystemOne.String(), SelectAPIFormat(typesafeEndpoints, &llm.Request{
+		RequestType: llm.RequestTypeSystemOne,
+		APIFormat:   llm.APIFormatTypeSafeSystemOne,
 	}))
 }
 
@@ -373,4 +484,38 @@ func TestPopulateAPIFormat_AlphaSearchDropsModelsWithoutAlphaEndpoint(t *testing
 	require.Equal(t, []biz.ChannelModelEntry{{RequestModel: "model-b", ActualModel: "model-b"}}, candidate.Models)
 	require.Equal(t, []string{llm.APIFormatOpenAIAlphaSearch.String()}, candidate.modelAPIFormats)
 	require.Equal(t, llm.APIFormatOpenAIAlphaSearch.String(), candidate.APIFormat)
+}
+
+func TestPopulateAPIFormat_DecisionsDropsModelsWithoutDecisionsEndpoint(t *testing.T) {
+	// Given one model forced to Chat and one forced to Decisions
+	ch := &biz.Channel{Channel: &ent.Channel{
+		ID:   1,
+		Name: "decisions-multi-model",
+		Type: channel.TypeOpenai,
+		Settings: &objects.ChannelSettings{ModelProtocols: []objects.ModelProtocol{
+			{Model: "model-a", APIFormats: []string{llm.APIFormatOpenAIChatCompletion.String()}},
+			{Model: "model-b", APIFormats: []string{llm.APIFormatOpenAIDecisions.String()}},
+		}},
+		Endpoints: []objects.ChannelEndpoint{{APIFormat: llm.APIFormatOpenAIDecisions.String()}},
+	}}
+	candidate := &ChannelModelsCandidate{
+		Channel: ch,
+		Models: []biz.ChannelModelEntry{
+			{RequestModel: "model-a", ActualModel: "model-a"},
+			{RequestModel: "model-b", ActualModel: "model-b"},
+		},
+	}
+
+	// When a Decisions request is populated
+	result := populateAPIFormat(context.Background(), []*ChannelModelsCandidate{candidate}, &llm.Request{
+		Model:       "requested-model",
+		RequestType: llm.RequestTypeDecisions,
+		APIFormat:   llm.APIFormatOpenAIDecisions,
+	})
+
+	// Then only the compatible model remains
+	require.Len(t, result, 1)
+	require.Equal(t, []biz.ChannelModelEntry{{RequestModel: "model-b", ActualModel: "model-b"}}, candidate.Models)
+	require.Equal(t, []string{llm.APIFormatOpenAIDecisions.String()}, candidate.modelAPIFormats)
+	require.Equal(t, llm.APIFormatOpenAIDecisions.String(), candidate.APIFormat)
 }

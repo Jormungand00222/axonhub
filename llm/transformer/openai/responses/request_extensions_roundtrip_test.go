@@ -636,6 +636,7 @@ func TestBuildReplayPlan(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, tools)
 		for i := range tools {
+			tools[i].Function.Name = flatFunctionName(tools[i].Function.Namespace, tools[i].Function.Name)
 			tools[i].ResponsesRawID = fmt.Sprintf("tools:%d", i)
 		}
 		return tools
@@ -1221,6 +1222,7 @@ func TestRequestExtensions_ReplaysEmptyAllowedToolChoice(t *testing.T) {
 	llmRequest, err := inbound.TransformRequest(context.Background(), &httpclient.Request{Body: []byte(`{
 		"model":"gpt-5.5",
 		"input":"run",
+		"tools":[{"type":"function","name":"lookup"}],
 		"tool_choice":{
 			"type":"allowed_tools",
 			"mode":"auto",
@@ -1303,7 +1305,7 @@ func TestRequestExtensions_ReplaysUnrepresentedToolChoices(t *testing.T) {
 		},
 		{
 			name:       "future selector policy",
-			tools:      `[]`,
+			tools:      `[{"type":"function","name":"lookup"}]`,
 			toolChoice: `{"type":"future_selector","policy":"strict"}`,
 		},
 		{
@@ -1371,7 +1373,7 @@ func TestRequestExtensions_ToolChoicePrimitiveMatrixRoundTrips(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := []byte(`{"model":"gpt-5.5","input":"use tools","tools":[],"tool_choice":` + tt.toolChoice + `}`)
+			body := []byte(`{"model":"gpt-5.5","input":"use tools","tools":[{"type":"function","name":"lookup"}],"tool_choice":` + tt.toolChoice + `}`)
 			inbound := NewInboundTransformer()
 			llmRequest, err := inbound.TransformRequest(context.Background(), &httpclient.Request{Body: body})
 			require.NoError(t, err)
